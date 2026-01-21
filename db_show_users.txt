@@ -1,0 +1,12 @@
+.headers on
+.mode column
+
+SELECT
+  chat_id,
+  username,
+  queue,
+  subqueue,
+  datetime(created_at,   'unixepoch', 'localtime') AS created_at_dt,
+  datetime(last_seen_at, 'unixepoch', 'localtime') AS last_seen_at_dt
+FROM users
+ORDER BY last_seen_at DESC;

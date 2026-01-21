@@ -1,0 +1,6 @@
+python-telegram-bot==21.6
+APScheduler==3.10.4
+requests==2.32.3
+beautifulsoup4==4.12.3
+opencv-python==4.10.0.84
+numpy==2.0.1
