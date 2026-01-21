@@ -3,6 +3,7 @@ import time
 import sqlite3
 import logging
 import hashlib
+import shutil
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -1180,10 +1181,27 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Unhandled error", exc_info=context.error)
 
 
+# ================= TRANSFER DB =================
+
+def ensure_seed_db():
+    # якщо на диску вже є база — нічого не робимо
+    if os.path.exists(DB_PATH):
+        return
+
+    seed = os.path.join(os.path.dirname(__file__), "data", "users.db")
+    if os.path.exists(seed):
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        shutil.copy2(seed, DB_PATH)
+
 # ================= MAIN =================
 
 def main():
     token = os.environ["BOT_TOKEN"]
+
+    if DB_PATH and os.path.dirname(DB_PATH):
+            os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+    ensure_seed_db()
     db_init()
 
     app = Application.builder().token(token).post_init(post_init).build()
