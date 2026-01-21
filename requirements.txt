@@ -1,6 +1,6 @@
-python-telegram-bot==21.6
+python-telegram-bot==20.7
 APScheduler==3.10.4
-requests==2.32.3
-beautifulsoup4==4.12.3
-opencv-python==4.10.0.84
-numpy==2.0.1
+requests==2.31.0
+numpy==1.26.4
+opencv-python-headless==4.9.0.80
+urllib3==2.2.1
