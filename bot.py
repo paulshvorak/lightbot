@@ -4,6 +4,7 @@ import sqlite3
 import logging
 import hashlib
 import shutil
+import asyncio
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -15,7 +16,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import Forbidden
+from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -39,13 +40,12 @@ DB_PATH = os.getenv("DB_PATH", "users.db")
 TZ = ZoneInfo("Europe/Uzhgorod")
 
 # Адміни (user_id). У приватному чаті user_id == chat_id.
-# Приклад: export ADMIN_IDS="123456789,987654321"
 ADMIN_IDS = {328587643}
 
 # Анти-спам / анти-трафік
 CACHE_TTL_SEC = 60          # не качати картинку частіше ніж раз/хв (на весь процес)
 PARSE_TTL_SEC = 60          # не парсити OpenCV частіше ніж раз/хв (на весь процес)
-NOW_COOLDOWN_SEC = 30       # не обробляти Now частіше ніж раз/30с на один чат
+NOW_COOLDOWN_SEC = 30       # не обробляти Now/Tomorrow частіше ніж раз/30с на один чат
 
 # Поріг визначення "темна клітинка" (нема світла) по V каналу HSV (підібраний)
 V_THRESHOLD = 185
@@ -99,7 +99,6 @@ def db_connect() -> sqlite3.Connection:
         con.execute("PRAGMA busy_timeout=3000")
         con.execute("PRAGMA synchronous=NORMAL")
     except Exception:
-        # якщо щось не так — не валимо бота
         pass
     return con
 
@@ -114,11 +113,23 @@ def _ensure_users_columns(con: sqlite3.Connection):
         "ALTER TABLE users ADD COLUMN username TEXT",
         "ALTER TABLE users ADD COLUMN created_at INTEGER",
         "ALTER TABLE users ADD COLUMN last_seen_at INTEGER",
-        # для “оновлено + стало більше/менше”
         "ALTER TABLE users ADD COLUMN last_total_off INTEGER",
         "ALTER TABLE users ADD COLUMN last_intervals TEXT",
-        # ✅ для (8) — перевіряти, чи зміни торкнулись майбутнього (потрібні попередні стани)
         "ALTER TABLE users ADD COLUMN last_states TEXT",
+
+        # ✅ NEW: розділена памʼять TODAY (в межах одного календарного дня)
+        "ALTER TABLE users ADD COLUMN today_day TEXT",             # YYYY-MM-DD
+        "ALTER TABLE users ADD COLUMN today_fingerprint TEXT",
+        "ALTER TABLE users ADD COLUMN today_total_off INTEGER",
+        "ALTER TABLE users ADD COLUMN today_intervals TEXT",
+        "ALTER TABLE users ADD COLUMN today_states TEXT",
+
+        # ✅ NEW: памʼять TOMORROW
+        "ALTER TABLE users ADD COLUMN tomorrow_day TEXT",          # YYYY-MM-DD (день, на який графік)
+        "ALTER TABLE users ADD COLUMN tomorrow_fingerprint TEXT",
+        "ALTER TABLE users ADD COLUMN tomorrow_total_off INTEGER",
+        "ALTER TABLE users ADD COLUMN tomorrow_intervals TEXT",
+        "ALTER TABLE users ADD COLUMN tomorrow_states TEXT",
     ]
     for ddl in ddls:
         try:
@@ -137,13 +148,26 @@ def db_init():
                 chat_id INTEGER PRIMARY KEY,
                 queue INTEGER NOT NULL,
                 subqueue INTEGER NOT NULL,
+
                 last_fingerprint TEXT,
                 username TEXT,
                 created_at INTEGER,
                 last_seen_at INTEGER,
                 last_total_off INTEGER,
                 last_intervals TEXT,
-                last_states TEXT
+                last_states TEXT,
+
+                today_day TEXT,
+                today_fingerprint TEXT,
+                today_total_off INTEGER,
+                today_intervals TEXT,
+                today_states TEXT,
+
+                tomorrow_day TEXT,
+                tomorrow_fingerprint TEXT,
+                tomorrow_total_off INTEGER,
+                tomorrow_intervals TEXT,
+                tomorrow_states TEXT
             )
         """)
 
@@ -168,9 +192,18 @@ def db_touch_user(chat_id: int, username: Optional[str]):
     with db_connect() as con:
         _ensure_users_columns(con)
         con.execute("""
-            INSERT INTO users(chat_id, queue, subqueue, last_fingerprint, username, created_at, last_seen_at,
-                              last_total_off, last_intervals, last_states)
-            VALUES(?, 1, 1, NULL, ?, ?, ?, NULL, NULL, NULL)
+            INSERT INTO users(
+                chat_id, queue, subqueue,
+                last_fingerprint, username, created_at, last_seen_at,
+                last_total_off, last_intervals, last_states,
+                today_day, today_fingerprint, today_total_off, today_intervals, today_states,
+                tomorrow_day, tomorrow_fingerprint, tomorrow_total_off, tomorrow_intervals, tomorrow_states
+            )
+            VALUES(?, 1, 1,
+                   NULL, ?, ?, ?,
+                   NULL, NULL, NULL,
+                   NULL, NULL, NULL, NULL, NULL,
+                   NULL, NULL, NULL, NULL, NULL)
             ON CONFLICT(chat_id) DO UPDATE SET
                 username=excluded.username,
                 last_seen_at=excluded.last_seen_at,
@@ -181,13 +214,21 @@ def db_touch_user(chat_id: int, username: Optional[str]):
 
 def db_upsert_user(chat_id: int, queue: int, subqueue: int):
     """
-    Оновлює чергу/підчергу. Fingerprint/summary/states записуємо окремо після парсингу.
+    Оновлює чергу/підчергу.
     """
     with db_connect() as con:
         _ensure_users_columns(con)
         con.execute("""
-            INSERT INTO users(chat_id, queue, subqueue, last_fingerprint, last_total_off, last_intervals, last_states)
-            VALUES(?, ?, ?, NULL, NULL, NULL, NULL)
+            INSERT INTO users(
+                chat_id, queue, subqueue,
+                last_fingerprint, last_total_off, last_intervals, last_states,
+                today_day, today_fingerprint, today_total_off, today_intervals, today_states,
+                tomorrow_day, tomorrow_fingerprint, tomorrow_total_off, tomorrow_intervals, tomorrow_states
+            )
+            VALUES(?, ?, ?,
+                   NULL, NULL, NULL, NULL,
+                   NULL, NULL, NULL, NULL, NULL,
+                   NULL, NULL, NULL, NULL, NULL)
             ON CONFLICT(chat_id) DO UPDATE
             SET queue=excluded.queue,
                 subqueue=excluded.subqueue
@@ -195,24 +236,37 @@ def db_upsert_user(chat_id: int, queue: int, subqueue: int):
         con.commit()
 
 
-def db_get_users() -> List[Tuple[int, int, int, Optional[str], Optional[int], Optional[str], Optional[str]]]:
+def db_get_users_for_push() -> List[Tuple[int, int, int, Optional[str], Optional[int], Optional[str], Optional[str], Optional[str]]]:
     """
+    Для today-changes пушів:
     Повертає:
-      (chat_id, queue, subqueue, last_fingerprint, last_total_off, last_intervals, last_states)
+      (chat_id, queue, subqueue, today_fingerprint, today_total_off, today_intervals, today_states, today_day)
     """
     with db_connect() as con:
         _ensure_users_columns(con)
         cur = con.execute("""
-            SELECT chat_id, queue, subqueue, last_fingerprint, last_total_off, last_intervals, last_states
+            SELECT chat_id, queue, subqueue,
+                   today_fingerprint, today_total_off, today_intervals, today_states, today_day
+            FROM users
+        """)
+        return list(cur.fetchall())
+
+
+def db_get_users_basic() -> List[Tuple[int, int, int, Optional[str], Optional[str]]]:
+    """
+    Для tomorrow-розсилок:
+      (chat_id, queue, subqueue, tomorrow_states, tomorrow_day)
+    """
+    with db_connect() as con:
+        _ensure_users_columns(con)
+        cur = con.execute("""
+            SELECT chat_id, queue, subqueue, tomorrow_states, tomorrow_day
             FROM users
         """)
         return list(cur.fetchall())
 
 
 def db_get_user_queue(chat_id: int) -> Optional[Tuple[int, int]]:
-    """
-    (1) Швидкий lookup без завантаження всіх users.
-    """
     with db_connect() as con:
         _ensure_users_columns(con)
         cur = con.execute("SELECT queue, subqueue FROM users WHERE chat_id=?", (chat_id,))
@@ -222,54 +276,33 @@ def db_get_user_queue(chat_id: int) -> Optional[Tuple[int, int]]:
         return int(row[0]), int(row[1])
 
 
-def db_get_user_last_summary(chat_id: int) -> Tuple[Optional[int], Optional[str], Optional[str]]:
-    """
-    Дістає (last_total_off, last_intervals, last_states) для чату.
-    """
+def db_set_today_memory(chat_id: int, day: str, fp: str, total_off: int, intervals_text: str, states_text: str):
     with db_connect() as con:
         _ensure_users_columns(con)
-        cur = con.execute(
-            "SELECT last_total_off, last_intervals, last_states FROM users WHERE chat_id=?",
-            (chat_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None, None, None
-        return row[0], row[1], row[2]
-
-
-def db_get_last_user() -> Optional[Tuple[int, Optional[str], Optional[int], Optional[int]]]:
-    """
-    "Останній" у сенсі новий: беремо за created_at DESC.
-    Повертає: (chat_id, username, created_at, last_seen_at)
-    """
-    with db_connect() as con:
-        _ensure_users_columns(con)
-        cur = con.execute("""
-            SELECT chat_id, username, created_at, last_seen_at
-            FROM users
-            WHERE created_at IS NOT NULL
-            ORDER BY created_at DESC
-            LIMIT 1
-        """)
-        row = cur.fetchone()
-        return row if row else None
-
-
-def db_update_fingerprint(chat_id: int, fingerprint: str):
-    with db_connect() as con:
-        _ensure_users_columns(con)
-        con.execute("UPDATE users SET last_fingerprint=? WHERE chat_id=?", (fingerprint, chat_id))
+        con.execute("""
+            UPDATE users
+            SET today_day=?,
+                today_fingerprint=?,
+                today_total_off=?,
+                today_intervals=?,
+                today_states=?
+            WHERE chat_id=?
+        """, (day, fp, total_off, intervals_text, states_text, chat_id))
         con.commit()
 
 
-def db_update_last_summary(chat_id: int, total_off: int, intervals_text: str, states_text: str):
+def db_set_tomorrow_memory(chat_id: int, day: str, fp: str, total_off: int, intervals_text: str, states_text: Optional[str]):
     with db_connect() as con:
         _ensure_users_columns(con)
-        con.execute(
-            "UPDATE users SET last_total_off=?, last_intervals=?, last_states=? WHERE chat_id=?",
-            (total_off, intervals_text, states_text, chat_id),
-        )
+        con.execute("""
+            UPDATE users
+            SET tomorrow_day=?,
+                tomorrow_fingerprint=?,
+                tomorrow_total_off=?,
+                tomorrow_intervals=?,
+                tomorrow_states=?
+            WHERE chat_id=?
+        """, (day, fp, total_off, intervals_text, states_text, chat_id))
         con.commit()
 
 
@@ -295,11 +328,21 @@ def db_meta_set(key: str, value: str):
         con.commit()
 
 
+def db_get_last_user() -> Optional[Tuple[int, Optional[str], Optional[int], Optional[int]]]:
+    with db_connect() as con:
+        _ensure_users_columns(con)
+        cur = con.execute("""
+            SELECT chat_id, username, created_at, last_seen_at
+            FROM users
+            WHERE created_at IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+        return row if row else None
+
+
 def touch_from_update(update: Update) -> None:
-    """
-    Універсально “тормошить” юзера (username, created_at, last_seen_at)
-    для будь-якої взаємодії.
-    """
     try:
         chat_id = update.effective_chat.id if update.effective_chat else None
         username = update.effective_user.username if update.effective_user else None
@@ -312,9 +355,6 @@ def touch_from_update(update: Update) -> None:
 # ================= QUIET HOURS HELPERS =================
 
 def is_quiet_hours(now_dt: Optional[datetime] = None) -> bool:
-    """
-    True якщо зараз у проміжку тихих годин: [QUIET_HOURS_START, QUIET_HOURS_END)
-    """
     if now_dt is None:
         now_dt = datetime.now(TZ)
     return QUIET_HOURS_START <= now_dt.hour < QUIET_HOURS_END
@@ -323,11 +363,6 @@ def is_quiet_hours(now_dt: Optional[datetime] = None) -> bool:
 # ================= API / IMAGE =================
 
 def fetch_latest_image_url_from_api(api_url: str) -> Optional[str]:
-    """
-    Повертає:
-      - str (URL), якщо value непорожній
-      - None, якщо value відсутній/порожній
-    """
     r = SESSION.get(api_url, timeout=30)
     r.raise_for_status()
     data = r.json()
@@ -369,8 +404,6 @@ _cached_img: Dict[str, Dict[str, Any]] = {
 }
 
 _parsed_cache: Dict[str, Dict[str, Any]] = {
-    # states: List[List[bool]] (12x48)
-    # intervals_by_row: List[List[Tuple[str,str]]] (12)
     API_TODAY: {"ts": 0.0, "url": None, "states": None, "intervals_by_row": None},
     API_TOMORROW: {"ts": 0.0, "url": None, "states": None, "intervals_by_row": None},
 }
@@ -486,6 +519,14 @@ def make_fingerprint(q: int, sq: int, row_states: List[bool]) -> str:
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
 
+def hash_intervals_by_row(intervals_by_row: List[List[Tuple[str, str]]]) -> str:
+    payload = "|".join(
+        ",".join(f"{a}-{b}" for a, b in row)
+        for row in intervals_by_row
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def get_states_cached(api_url: str) -> Tuple[Optional[str], Optional[List[List[bool]]]]:
     """
     Парсить (або віддає з кешу) матрицю states 12x48.
@@ -505,8 +546,6 @@ def get_states_cached(api_url: str) -> Tuple[Optional[str], Optional[List[List[b
             return url, pc["states"]
 
         states = read_all_rows_states(img, GRID)
-
-        # (3) одразу рахуємо інтервали для всіх рядків та кешуємо
         intervals_by_row = [intervals_from_states(r) for r in states]
 
         pc["ts"] = now
@@ -526,7 +565,7 @@ def get_states_cached(api_url: str) -> Tuple[Optional[str], Optional[List[List[b
 
 def get_intervals_by_row_cached(api_url: str) -> Tuple[Optional[str], Optional[List[List[Tuple[str, str]]]]]:
     """
-    (3) Кешований доступ до інтервалів для всіх 12 рядків.
+    Кешований доступ до інтервалів для всіх 12 рядків.
     """
     now = time.time()
     pc = _parsed_cache.setdefault(api_url, {"ts": 0.0, "url": None, "states": None, "intervals_by_row": None})
@@ -538,7 +577,6 @@ def get_intervals_by_row_cached(api_url: str) -> Tuple[Optional[str], Optional[L
     if not url or not states:
         return None, None
 
-    # якщо states прийшли, але intervals_by_row не збережено — доб'ємо
     if pc.get("intervals_by_row") is None:
         pc["intervals_by_row"] = [intervals_from_states(r) for r in states]
 
@@ -586,7 +624,6 @@ def build_update_prefix(
 
     lines = [header, ""]
     delta_line = None
-    change_line = None
 
     if old_total_off is not None:
         delta = new_total_off - old_total_off
@@ -597,17 +634,12 @@ def build_update_prefix(
         else:
             delta_line = "➖ Кількість світла не змінилась"
 
-    if old_intervals_text is not None and old_intervals_text != new_intervals_text:
-        change_line = "🔁 Змінився час відключення"
-
     if old_total_off is None and old_intervals_text is None:
         lines.append("ℹ️ Оновили графік — показую актуальний стан")
         return "\n".join(lines).strip()
 
     if delta_line:
         lines.append(delta_line)
-    if change_line:
-        lines.append(change_line)
 
     return "\n".join(lines).strip()
 
@@ -651,20 +683,18 @@ def filter_past_intervals(intervals: List[Tuple[str, str]], now_dt: datetime) ->
 
 
 def _current_slot_index(now_dt: datetime) -> int:
-    # 0..47 (крок 30 хв)
     return (now_dt.hour * 60 + now_dt.minute) // 30
 
 
 def future_changed_only(row_states_new: List[bool], row_states_old_text: Optional[str], now_dt: datetime) -> bool:
     """
-    (8) True якщо є зміни у майбутніх слотах (від поточного слоту до кінця).
+    True якщо є зміни у майбутніх слотах (від поточного слоту до кінця).
     Якщо old_text нема — вважаємо що зміни релевантні.
     """
     if not row_states_old_text or len(row_states_old_text) != 48:
         return True
 
     idx = _current_slot_index(now_dt)
-    # порівнюємо тільки майбутнє (включно з поточним слотом)
     for i in range(idx, 48):
         old_off = (row_states_old_text[i] == "1")
         if row_states_new[i] != old_off:
@@ -736,6 +766,21 @@ def tomorrow_label(now_dt: Optional[datetime] = None) -> str:
         now_dt = datetime.now(TZ)
     tomorrow = now_dt.date() + timedelta(days=1)
     return tomorrow.strftime("%d.%m")
+
+
+def day_str(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+
+def tomorrow_day_str(now_dt: Optional[datetime] = None) -> str:
+    if now_dt is None:
+        now_dt = datetime.now(TZ)
+    return (now_dt.date() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _cooldown_left(last_ts: float, cooldown: int) -> int:
+    left = int(cooldown - (time.time() - last_ts))
+    return max(0, left)
 
 
 # ================= UI (BUTTONS) =================
@@ -887,25 +932,26 @@ async def on_set_subqueue_button(update: Update, context: ContextTypes.DEFAULT_T
 
     db_upsert_user(chat_id, queue, subqueue)
 
-    # ініціалізуємо fingerprint + summary + last_states, щоб не було "першого пуша"
+    # ініціалізуємо TODAY-памʼять (на поточний день), щоб не було "першого пуша"
     try:
         url, states = get_states_cached(API_TODAY)
         if url and states:
             row = _row_index(queue, subqueue)
             row_states = states[row]
-
             fp = make_fingerprint(queue, subqueue, row_states)
             intervals = intervals_from_states(row_states)
 
-            db_update_fingerprint(chat_id, fp)
-            db_update_last_summary(
+            today = day_str(datetime.now(TZ))
+            db_set_today_memory(
                 chat_id,
+                today,
+                fp,
                 total_off_minutes(intervals),
                 intervals_to_text(intervals),
                 states_to_text(row_states),
             )
     except Exception:
-        log.exception("Failed to init fingerprint/summary on set queue")
+        log.exception("Failed to init today memory on set queue")
 
     await q.edit_message_text(f"✅ Збережено: черга {queue}/{subqueue}\n\nМеню 👇", reply_markup=main_menu_kb())
 
@@ -913,41 +959,46 @@ async def on_set_subqueue_button(update: Update, context: ContextTypes.DEFAULT_T
 async def on_menu_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_from_update(update)
     q = update.callback_query
+    if not q or not q.message:
+        return
+
     chat_id = q.message.chat_id
 
+    # cooldown (на чат) — ПОПАП і вихід
     t = time.time()
     last = _last_now.get(chat_id, 0.0)
     if t - last < NOW_COOLDOWN_SEC:
-        await q.answer("⏳ Занадто часто. Спробуй трохи пізніше.", show_alert=False)
+        left = _cooldown_left(last, NOW_COOLDOWN_SEC)
+        try:
+            await q.answer(f"⏳ Зачекай {left}с", show_alert=False)
+        except Exception:
+            pass
         return
     _last_now[chat_id] = t
 
-    qs = db_get_user_queue(chat_id)  # (1)
+    qs = db_get_user_queue(chat_id)
     if not qs:
-        await q.answer()
-        await q.edit_message_text("Спочатку натисни Set і обери чергу.", reply_markup=main_menu_kb())
+        try:
+            await q.answer("Спочатку обери чергу через ⚙️ Set", show_alert=False)
+        except Exception:
+            pass
         return
     queue, subqueue = qs
 
     try:
-        url, states = get_states_cached(API_TODAY)
+        # не блокуємо event loop
+        url, states = await asyncio.to_thread(get_states_cached, API_TODAY)
+
         if not url or not states:
-            await q.answer("⚠️ Сервер графіків тимчасово недоступний. Спробуй ще раз.", show_alert=True)
+            try:
+                await q.answer("⚠️ Сервер графіків недоступний", show_alert=False)
+            except Exception:
+                pass
             return
 
         row = _row_index(queue, subqueue)
         row_states = states[row]
         full_intervals = intervals_from_states(row_states)
-
-        # записуємо fingerprint + summary + last_states після ручного запиту
-        fp = make_fingerprint(queue, subqueue, row_states)
-        db_update_fingerprint(chat_id, fp)
-        db_update_last_summary(
-            chat_id,
-            total_off_minutes(full_intervals),
-            intervals_to_text(full_intervals),
-            states_to_text(row_states),
-        )
 
         now_dt = datetime.now(TZ)
         view_intervals = filter_past_intervals(full_intervals, now_dt)
@@ -955,42 +1006,84 @@ async def on_menu_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = format_outages_by_dayparts_today(view_intervals, now_has_light, now_dt, full_intervals)
 
+        # якщо нічого не змінилось — показуємо "Актуально" і виходимо
         msg = q.message
         if msg and msg.text == text:
-            await q.answer("✅ Актуально", show_alert=False)
+            try:
+                await q.answer("✅ Актуально", show_alert=False)
+            except Exception:
+                pass
             return
 
-        await q.answer()
+        # ✅ тут робимо один "порожній" ack (або можна взагалі не робити)
+        try:
+            await q.answer()
+        except Exception:
+            pass
+
+        # оновлюємо TODAY-памʼять
+        today = day_str(now_dt)
+        fp = make_fingerprint(queue, subqueue, row_states)
+        db_set_today_memory(
+            chat_id,
+            today,
+            fp,
+            total_off_minutes(full_intervals),
+            intervals_to_text(full_intervals),
+            states_to_text(row_states),
+        )
+
         await q.edit_message_text(text, reply_markup=main_menu_kb())
 
+    except BadRequest as e:
+        log.warning("Telegram BadRequest in on_menu_now: %s", e)
     except Exception:
         log.exception("now failed")
-        await q.answer("⚠️ Сталася помилка. Спробуй ще раз.", show_alert=True)
+        try:
+            await q.answer("⚠️ Сталася помилка. Спробуй ще раз.", show_alert=False)
+        except Exception:
+            pass
 
 
 async def on_menu_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_from_update(update)
     q = update.callback_query
+    if not q or not q.message:
+        return
+
     chat_id = q.message.chat_id
 
+    # cooldown — ПОПАП і вихід
     t = time.time()
     last = _last_tomorrow.get(chat_id, 0.0)
     if t - last < NOW_COOLDOWN_SEC:
-        await q.answer("⏳ Занадто часто. Спробуй трохи пізніше.", show_alert=False)
+        left = _cooldown_left(last, NOW_COOLDOWN_SEC)
+        try:
+            await q.answer(f"⏳ Зачекай {left}с", show_alert=False)
+        except Exception:
+            pass
         return
     _last_tomorrow[chat_id] = t
 
-    qs = db_get_user_queue(chat_id)  # (1)
+    qs = db_get_user_queue(chat_id)
     if not qs:
-        await q.answer()
-        await q.edit_message_text("Спочатку натисни Set і обери чергу.", reply_markup=main_menu_kb())
+        try:
+            await q.answer("Спочатку обери чергу через ⚙️ Set", show_alert=False)
+        except Exception:
+            pass
         return
     queue, subqueue = qs
 
     try:
-        url, intervals_by_row = get_intervals_by_row_cached(API_TOMORROW)  # (3)
+        url, intervals_by_row = await asyncio.to_thread(get_intervals_by_row_cached, API_TOMORROW)
+
+        # ✅ якщо графіків нема — завжди ПОПАП і вихід
         if not url or not intervals_by_row:
-            await q.answer("🕓 Графіків на завтра ще немає", show_alert=True)
+            label = tomorrow_label()
+            try:
+                await q.answer(f"🕓 Графіків на завтра ({label}) ще немає", show_alert=False)
+            except Exception:
+                pass
             return
 
         row = _row_index(queue, subqueue)
@@ -1001,15 +1094,28 @@ async def on_menu_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         msg = q.message
         if msg and msg.text == text:
-            await q.answer("✅ Актуально", show_alert=False)
+            try:
+                await q.answer("✅ Актуально", show_alert=False)
+            except Exception:
+                pass
             return
 
-        await q.answer()
+        # ✅ один ack перед edit
+        try:
+            await q.answer()
+        except Exception:
+            pass
+
         await q.edit_message_text(text, reply_markup=main_menu_kb())
 
+    except BadRequest as e:
+        log.warning("Telegram BadRequest in on_menu_tomorrow: %s", e)
     except Exception:
         log.exception("tomorrow failed")
-        await q.answer("⚠️ Сталася помилка. Спробуй ще раз.", show_alert=True)
+        try:
+            await q.answer("⚠️ Сталася помилка. Спробуй ще раз.", show_alert=False)
+        except Exception:
+            pass
 
 
 async def on_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1024,32 +1130,77 @@ async def on_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= SCHEDULER JOBS =================
 
-async def broadcast_tomorrow_if_published(app: Application):
+def _tomorrow_global_published_for(day_ymd: str) -> bool:
+    return db_meta_get("tomorrow_published_day") == day_ymd
+
+
+def _tomorrow_global_hash() -> Optional[str]:
+    return db_meta_get("tomorrow_hash")
+
+
+async def broadcast_tomorrow_first_publish(app: Application):
+    """
+    Вимоги:
+    - користувач отримує ЗАВТРА лише один раз, коли воно з'явилось
+    - після цього ми НЕ робимо запитів на завтра (щоб не створювати трафік),
+      окрім одного запиту о 23:58 (інша job).
+    """
     if is_quiet_hours():
         return
 
-    url_t, intervals_by_row = get_intervals_by_row_cached(API_TOMORROW)  # (3)
+    now_dt = datetime.now(TZ)
+    tday = tomorrow_day_str(now_dt)
+
+    # ✅ якщо вже розіслали "завтра" для цього дня — ВИХОДИМО БЕЗ ЗАПИТУ В API
+    if _tomorrow_global_published_for(tday):
+        return
+
+    # Тут робимо один запит (бо ще не публікували)
+    url_t, intervals_by_row = get_intervals_by_row_cached(API_TOMORROW)
     if not url_t or not intervals_by_row:
         return
 
-    last_url = db_meta_get("last_tomorrow_url")
-    if last_url == url_t:
-        return
+    cur_hash = hash_intervals_by_row(intervals_by_row)
 
-    users = db_get_users()
+    users = db_get_users_basic()
     if not users:
-        db_meta_set("last_tomorrow_url", url_t)
+        db_meta_set("tomorrow_published_day", tday)
+        db_meta_set("tomorrow_hash", cur_hash)
         return
 
-    label = tomorrow_label()
+    label = tomorrow_label(now_dt)
     sent = 0
     removed = 0
 
-    for chat_id, queue, subqueue, *_ in users:
+    for chat_id, queue, subqueue, _, _ in users:
         try:
             row = _row_index(queue, subqueue)
             full_intervals = intervals_by_row[row]
             msg = f"📅 Завтра ({label})\n\n" + format_outages_by_dayparts_plain(full_intervals)
+
+            # ✅ записуємо TOMORROW-памʼять користувача (по його черзі)
+            states = _parsed_cache.get(API_TOMORROW, {}).get("states")
+            if states:
+                row_states = states[row]
+                fp = make_fingerprint(queue, subqueue, row_states)
+                db_set_tomorrow_memory(
+                    chat_id,
+                    tday,
+                    fp,
+                    total_off_minutes(full_intervals),
+                    intervals_to_text(full_intervals),
+                    states_to_text(row_states),
+                )
+            else:
+                # fallback: збережемо хоча б інтервали, fingerprint — як глобальний hash
+                db_set_tomorrow_memory(
+                    chat_id,
+                    tday,
+                    cur_hash,
+                    total_off_minutes(full_intervals),
+                    intervals_to_text(full_intervals),
+                    None,
+                )
 
             await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb())
             sent += 1
@@ -1062,68 +1213,158 @@ async def broadcast_tomorrow_if_published(app: Application):
         except Exception:
             log.exception("Failed sending tomorrow to chat_id=%s", chat_id)
 
-    db_meta_set("last_tomorrow_url", url_t)
-    log.info("Tomorrow broadcast done: sent=%d removed=%d total=%d", sent, removed, len(users))
+    # ✅ після успішної розсилки блокуємо подальші перевірки "завтра" (без API запитів)
+    db_meta_set("tomorrow_published_day", tday)
+    db_meta_set("tomorrow_hash", cur_hash)
+
+    log.info("Tomorrow first publish: sent=%d removed=%d total=%d day=%s", sent, removed, len(users), tday)
 
 
-async def broadcast_today_changes(app: Application):
+async def check_tomorrow_update_2358(app: Application):
+    """
+    Вимога:
+    - о 23:58 робимо ОДИН запит на завтра
+    - якщо змінилось — присилаємо "графіки на завтра оновились"
+    """
     if is_quiet_hours():
         return
 
-    users = db_get_users()
+    now_dt = datetime.now(TZ)
+    tday = tomorrow_day_str(now_dt)
+
+    # Якщо завтра ще не публікували — нема сенсу "оновлення" (воно буде першим publish)
+    if not _tomorrow_global_published_for(tday):
+        return
+
+    url_t, intervals_by_row = get_intervals_by_row_cached(API_TOMORROW)
+    if not url_t or not intervals_by_row:
+        return
+
+    cur_hash = hash_intervals_by_row(intervals_by_row)
+    last_hash = _tomorrow_global_hash()
+
+    if last_hash == cur_hash:
+        return
+
+    users = db_get_users_basic()
+    if not users:
+        db_meta_set("tomorrow_hash", cur_hash)
+        return
+
+    label = tomorrow_label(now_dt)
+    sent = 0
+    removed = 0
+
+    for chat_id, queue, subqueue, _, _ in users:
+        try:
+            row = _row_index(queue, subqueue)
+            full_intervals = intervals_by_row[row]
+            msg = "🔄 Графіки на завтра оновились\n\n" + f"📅 Завтра ({label})\n\n" + format_outages_by_dayparts_plain(full_intervals)
+
+            # оновлюємо TOMORROW-памʼять користувача
+            states = _parsed_cache.get(API_TOMORROW, {}).get("states")
+            if states:
+                row_states = states[row]
+                fp = make_fingerprint(queue, subqueue, row_states)
+                db_set_tomorrow_memory(
+                    chat_id,
+                    tday,
+                    fp,
+                    total_off_minutes(full_intervals),
+                    intervals_to_text(full_intervals),
+                    states_to_text(row_states),
+                )
+
+            await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb())
+            sent += 1
+
+        except Forbidden:
+            db_delete_user(chat_id)
+            removed += 1
+        except Exception:
+            log.exception("Failed sending tomorrow-update to chat_id=%s", chat_id)
+
+    db_meta_set("tomorrow_hash", cur_hash)
+    log.info("Tomorrow 23:58 update: sent=%d removed=%d total=%d day=%s", sent, removed, len(users), tday)
+
+
+async def broadcast_today_changes(app: Application):
+    """
+    Вимога:
+    - впродовж дня сигналізуємо зміни в черзі користувача
+    - порівнюємо завжди з останнім СЬОГОДНІ
+    - НЕ порівнюємо з вчорашнім today (якщо day змінився — просто ініціалізуємо today-базу і НЕ пушимо)
+    """
+    if is_quiet_hours():
+        return
+
+    users = db_get_users_for_push()
     if not users:
         return
+
+    now_dt = datetime.now(TZ)
+    today = day_str(now_dt)
 
     try:
         url, states = get_states_cached(API_TODAY)
         if not url or not states:
             return
 
-        _, intervals_by_row = get_intervals_by_row_cached(API_TODAY)
+        intervals_by_row = _parsed_cache.get(API_TODAY, {}).get("intervals_by_row")
         if not intervals_by_row:
             intervals_by_row = [intervals_from_states(r) for r in states]
 
-        now_dt = datetime.now(TZ)
-
-        for chat_id, queue, subqueue, last_fp, last_total_off, last_intervals_txt, last_states_txt in users:
+        for chat_id, queue, subqueue, last_fp, last_total_off, last_intervals_txt, last_states_txt, last_day in users:
             row = _row_index(queue, subqueue)
             row_states = states[row]
-
             fp = make_fingerprint(queue, subqueue, row_states)
-            if fp == last_fp:
-                continue  # жодних змін у графіку
-
-            # ✅ NEW: якщо нема з чим порівнювати — ініціалізуємо і НЕ пушимо
-            if (last_fp is None) or (last_total_off is None) or (last_intervals_txt is None) or (last_states_txt is None):
-                intervals_full = intervals_by_row[row]
-                db_update_fingerprint(chat_id, fp)
-                db_update_last_summary(
-                    chat_id,
-                    total_off_minutes(intervals_full),
-                    intervals_to_text(intervals_full),
-                    states_to_text(row_states),
-                )
-                continue
-
-            # (8) якщо зміни тільки в минулих слотах — НЕ пушимо, але оновлюємо last_* щоб не зациклювало
-            if not future_changed_only(row_states, last_states_txt, now_dt):
-                db_update_fingerprint(chat_id, fp)
-                intervals_full = intervals_by_row[row]
-                db_update_last_summary(
-                    chat_id,
-                    total_off_minutes(intervals_full),
-                    intervals_to_text(intervals_full),
-                    states_to_text(row_states),
-                )
-                continue
-
             full_intervals = intervals_by_row[row]
-            view_intervals = filter_past_intervals(full_intervals, now_dt)
-            now_has_light = is_light_now(full_intervals, now_dt)
+
+            # ✅ якщо настав новий день — просто приймаємо поточний графік як базу і НЕ пушимо
+            if last_day != today:
+                db_set_today_memory(
+                    chat_id,
+                    today,
+                    fp,
+                    total_off_minutes(full_intervals),
+                    intervals_to_text(full_intervals),
+                    states_to_text(row_states),
+                )
+                continue
+
+            # якщо ще нема з чим порівнювати в межах дня — ініціалізуємо і НЕ пушимо
+            if (last_fp is None) or (last_total_off is None) or (last_intervals_txt is None) or (last_states_txt is None):
+                db_set_today_memory(
+                    chat_id,
+                    today,
+                    fp,
+                    total_off_minutes(full_intervals),
+                    intervals_to_text(full_intervals),
+                    states_to_text(row_states),
+                )
+                continue
+
+            if fp == last_fp:
+                continue  # жодних змін
+
+            # якщо зміни тільки в минулих слотах — НЕ пушимо, але оновлюємо базу, щоб не зациклювало
+            if not future_changed_only(row_states, last_states_txt, now_dt):
+                db_set_today_memory(
+                    chat_id,
+                    today,
+                    fp,
+                    total_off_minutes(full_intervals),
+                    intervals_to_text(full_intervals),
+                    states_to_text(row_states),
+                )
+                continue
 
             new_total_off = total_off_minutes(full_intervals)
             new_intervals_txt = intervals_to_text(full_intervals)
             prefix = build_update_prefix(last_total_off, last_intervals_txt, new_total_off, new_intervals_txt)
+
+            view_intervals = filter_past_intervals(full_intervals, now_dt)
+            now_has_light = is_light_now(full_intervals, now_dt)
 
             body = format_outages_by_dayparts_today(view_intervals, now_has_light, now_dt, full_intervals)
             msg = prefix + "\n\n" + body
@@ -1131,20 +1372,19 @@ async def broadcast_today_changes(app: Application):
             try:
                 await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb())
 
-                db_update_fingerprint(chat_id, fp)
-                db_update_last_summary(
+                db_set_today_memory(
                     chat_id,
+                    today,
+                    fp,
                     new_total_off,
                     new_intervals_txt,
                     states_to_text(row_states),
                 )
 
             except Forbidden:
-                log.warning("User blocked bot, removing chat_id=%s", chat_id)
                 db_delete_user(chat_id)
-
             except Exception:
-                log.exception("Failed sending today to chat_id=%s", chat_id)
+                log.exception("Failed sending today change to chat_id=%s", chat_id)
 
     except Exception:
         log.exception("broadcast(today) failed")
@@ -1153,6 +1393,7 @@ async def broadcast_today_changes(app: Application):
 async def post_init(app: Application):
     scheduler = AsyncIOScheduler(timezone=TZ)
 
+    # протягом дня — перевірка today змін (як і було)
     scheduler.add_job(
         broadcast_today_changes,
         "cron",
@@ -1161,8 +1402,9 @@ async def post_init(app: Application):
         timezone=TZ,
     )
 
+    # publish "tomorrow" рівно один раз, як тільки з'явилось
     scheduler.add_job(
-        broadcast_tomorrow_if_published,
+        broadcast_tomorrow_first_publish,
         "cron",
         hour="18-23",
         minute="*/5",
@@ -1170,9 +1412,21 @@ async def post_init(app: Application):
         timezone=TZ,
     )
 
+    # один контрольний запит на завтра о 23:58
+    scheduler.add_job(
+        check_tomorrow_update_2358,
+        "cron",
+        hour="23",
+        minute="58",
+        args=[app],
+        timezone=TZ,
+    )
+
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
-    log.info("Scheduler started (today: 1/16/31/46, tomorrow-check: 18-23 кажні 5 хв)")
+    log.info(
+        "Scheduler started (today: 1/16/31/46, tomorrow-publish: 18-23 кожні 5 хв, tomorrow-check: 23:58)"
+    )
 
 
 # ================= ERROR HANDLER =================
@@ -1184,7 +1438,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ================= TRANSFER DB =================
 
 def ensure_seed_db():
-    # якщо на диску вже є база — нічого не робимо
     if os.path.exists(DB_PATH):
         return
 
@@ -1193,13 +1446,14 @@ def ensure_seed_db():
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         shutil.copy2(seed, DB_PATH)
 
+
 # ================= MAIN =================
 
 def main():
     token = os.environ["BOT_TOKEN"]
 
     if DB_PATH and os.path.dirname(DB_PATH):
-            os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
     ensure_seed_db()
     db_init()
