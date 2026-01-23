@@ -900,6 +900,26 @@ async def admin_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"last_seen_at: {fmt_ts(last_seen_at)}"
     )
 
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    with db_connect() as con:
+        rows = con.execute("""
+            SELECT chat_id,
+                   COALESCE(username, '-') AS username,
+                   last_seen_at
+            FROM users
+            ORDER BY last_seen_at DESC
+            LIMIT 20
+        """).fetchall()
+
+    text = build_users_table(rows)
+
+    await update.message.reply_text(
+        f"<pre>{text}</pre>",
+        parse_mode="HTML"
+    )
 
 async def on_menu_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_from_update(update)
@@ -1465,6 +1485,7 @@ def main():
     app.add_handler(CommandHandler("id", my_id))
     app.add_handler(CommandHandler("say", admin_say))
     app.add_handler(CommandHandler("last", admin_last))
+    app.add_handler(CommandHandler("users", admin_users))
 
     app.add_handler(CallbackQueryHandler(on_menu_set, pattern=r"^menu:set$"))
     app.add_handler(CallbackQueryHandler(on_menu_now, pattern=r"^menu:now$"))
