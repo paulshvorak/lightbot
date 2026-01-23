@@ -900,26 +900,66 @@ async def admin_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"last_seen_at: {fmt_ts(last_seen_at)}"
     )
 
+def build_users_table(rows: list[tuple[int, str, Optional[int]]]) -> str:
+    """
+    rows: (chat_id, username, last_seen_at)
+    Повертає моноширинну "табличку" для <pre>...</pre>
+    """
+    def fmt_ts(ts: Optional[int]) -> str:
+        if not ts:
+            return "—"
+        return datetime.fromtimestamp(ts, TZ).strftime("%d.%m %H:%M")
+
+    header = [
+        f"👥 Users ({len(rows)})",
+        "",
+        "username        id          last_seen",
+        "-------------------------------------",
+    ]
+
+    lines = []
+    for chat_id, username, last_seen_at in rows:
+        uname = username if username and username != "-" else "-"
+        # робимо @ якщо є юзернейм
+        if uname != "-" and not uname.startswith("@"):
+            uname = "@" + uname
+
+        lines.append(f"{uname:<14} {str(chat_id):<11} {fmt_ts(last_seen_at)}")
+
+    return "\n".join(header + lines)
+
+
 async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    touch_from_update(update)
+
+    u = update.effective_user
+    if not u or u.id not in ADMIN_IDS:
         return
 
     with db_connect() as con:
+        _ensure_users_columns(con)
         rows = con.execute("""
-            SELECT chat_id,
-                   COALESCE(username, '-') AS username,
-                   last_seen_at
+            SELECT
+                chat_id,
+                COALESCE(username, '-') AS username,
+                last_seen_at
             FROM users
-            ORDER BY last_seen_at DESC
-            LIMIT 20
+            ORDER BY COALESCE(last_seen_at, 0) DESC
+            LIMIT 200
         """).fetchall()
+
+    if not rows:
+        await update.message.reply_text("У базі ще немає користувачів.")
+        return
 
     text = build_users_table(rows)
 
-    await update.message.reply_text(
-        f"<pre>{text}</pre>",
-        parse_mode="HTML"
-    )
+    # Telegram має ліміт на повідомлення — підріжемо якщо треба
+    if len(text) > 3900:
+        text = text[:3900] + "\n…(обрізано)"
+
+    await update.message.reply_text(f"<pre>{text}</pre>", parse_mode="HTML")
+
 
 async def on_menu_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_from_update(update)

@@ -1,0 +1,5 @@
+sudo systemctl stop lightbot
+cd /opt/lightbot/app
+git pull
+sudo systemctl start lightbot
+journalctl -u lightbot -n 20
