@@ -1397,7 +1397,7 @@ async def post_init(app: Application):
     scheduler.add_job(
         broadcast_today_changes,
         "cron",
-        minute="1,16,31,46",
+        minute="*/5",
         args=[app],
         timezone=TZ,
     )
