@@ -701,6 +701,77 @@ def future_changed_only(row_states_new: List[bool], row_states_old_text: Optiona
             return True
     return False
 
+def slots_to_intervals_from_index(slots: List[bool], start_idx: int = 0) -> List[Tuple[str, str]]:
+    """
+    slots: 48 bool, True=off
+    start_idx: з якого слоту рахувати (майбутнє)
+    """
+    intervals = []
+    start = None
+
+    for i in range(start_idx, 48):
+        off = slots[i]
+        if off and start is None:
+            start = i
+        if (not off) and start is not None:
+            intervals.append((start, i))
+            start = None
+
+    if start is not None:
+        intervals.append((start, 48))
+
+    def slot_to_time(s: int) -> str:
+        if s == 48:
+            return "24:00"
+        m = s * 30
+        return f"{m // 60:02d}:{m % 60:02d}"
+
+    return [(slot_to_time(a), slot_to_time(b)) for a, b in intervals]
+
+
+def states_text_to_slots(states_text: str) -> List[bool]:
+    """states_text: '1'=off, '0'=on, len=48"""
+    return [(ch == "1") for ch in states_text[:48]]
+
+
+def diff_future_intervals(
+    old_states_text: Optional[str],
+    new_states_48: List[bool],
+    now_dt: datetime
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """
+    Повертає (cancelled, added) тільки для майбутніх слотів (від поточного до кінця).
+    cancelled: було OFF, стало ON
+    added:     було ON, стало OFF
+    """
+    if not old_states_text or len(old_states_text) != 48:
+        # нема з чим порівнювати
+        return [], []
+
+    old_slots = states_text_to_slots(old_states_text)
+    idx = _current_slot_index(now_dt)
+
+    cancelled_slots = [False] * 48
+    added_slots = [False] * 48
+
+    for i in range(idx, 48):
+        o = old_slots[i]
+        n = new_states_48[i]
+        if o and not n:
+            cancelled_slots[i] = True
+        elif (not o) and n:
+            added_slots[i] = True
+
+    cancelled = slots_to_intervals_from_index(cancelled_slots, idx)
+    added = slots_to_intervals_from_index(added_slots, idx)
+    return cancelled, added
+
+
+def fmt_interval_lines(intervals: List[Tuple[str, str]], prefix: str) -> str:
+    if not intervals:
+        return "—"
+    return "\n".join([f"{prefix} {a}–{b}" for a, b in intervals])
+
 
 def format_outages_by_dayparts_today(
     intervals: List[Tuple[str, str]],
@@ -1438,9 +1509,27 @@ async def broadcast_today_changes(app: Application):
                 )
                 continue
 
-            new_total_off = total_off_minutes(full_intervals)
-            new_intervals_txt = intervals_to_text(full_intervals)
-            prefix = build_update_prefix(last_total_off, last_intervals_txt, new_total_off, new_intervals_txt)
+            cancelled, added = diff_future_intervals(last_states_txt, row_states, now_dt)
+
+            lines = ["🔄 Графік оновлено для твоєї черги", ""]
+
+            if cancelled:
+                lines.append("❎ Скасували відключення:")
+                lines.append(fmt_interval_lines(cancelled, "❌"))
+                lines.append("")
+
+            if added:
+                lines.append("➕ Додали відключення:")
+                lines.append(fmt_interval_lines(added, "➕"))
+                lines.append("")
+
+            # на випадок, якщо fp змінився, але в майбутньому перетворення “в нуль” (дуже рідко)
+            if (not cancelled) and (not added):
+                lines.append("➖ Змін у майбутніх годинах не бачу")
+                lines.append("")
+
+            prefix = "\n".join(lines).strip()
+
 
             view_intervals = filter_past_intervals(full_intervals, now_dt)
             now_has_light = is_light_now(full_intervals, now_dt)
