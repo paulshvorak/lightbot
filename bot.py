@@ -252,15 +252,16 @@ def db_get_users_for_push() -> List[Tuple[int, int, int, Optional[str], Optional
         return list(cur.fetchall())
 
 
-def db_get_users_basic() -> List[Tuple[int, int, int, Optional[str], Optional[str]]]:
+def db_get_users_basic() -> List[Tuple[int, int, int, Optional[str], Optional[str], Optional[str]]]:
     """
     Для tomorrow-розсилок:
-      (chat_id, queue, subqueue, tomorrow_states, tomorrow_day)
+      (chat_id, queue, subqueue, tomorrow_fingerprint, tomorrow_states, tomorrow_day)
     """
     with db_connect() as con:
         _ensure_users_columns(con)
         cur = con.execute("""
-            SELECT chat_id, queue, subqueue, tomorrow_states, tomorrow_day
+            SELECT chat_id, queue, subqueue,
+                   tomorrow_fingerprint, tomorrow_states, tomorrow_day
             FROM users
         """)
         return list(cur.fetchall())
@@ -815,7 +816,7 @@ def format_outages_by_dayparts_plain(intervals: List[Tuple[str, str]]) -> str:
     parts = {"🌙 Ніч": [], "☀️ День": [], "🌆 Вечір": []}
     for a, b in intervals:
         start = _to_minutes(a)
-        if start < 8 * 60:
+        if start < 6 * 60:
             parts["🌙 Ніч"].append((a, b))
         elif start < 16 * 60:
             parts["☀️ День"].append((a, b))
@@ -1280,163 +1281,96 @@ async def on_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= SCHEDULER JOBS =================
 
-def _tomorrow_global_published_for(day_ymd: str) -> bool:
-    return db_meta_get("tomorrow_published_day") == day_ymd
-
-
-def _tomorrow_global_hash() -> Optional[str]:
-    return db_meta_get("tomorrow_hash")
-
-
-async def broadcast_tomorrow_first_publish(app: Application):
-    """
-    Вимоги:
-    - користувач отримує ЗАВТРА лише один раз, коли воно з'явилось
-    - після цього ми НЕ робимо запитів на завтра (щоб не створювати трафік),
-      окрім одного запиту о 23:58 (інша job).
-    """
+async def broadcast_tomorrow_poll(app: Application):
     if is_quiet_hours():
         return
 
     now_dt = datetime.now(TZ)
     tday = tomorrow_day_str(now_dt)
+    label = tomorrow_label(now_dt)
 
-    # ✅ якщо вже розіслали "завтра" для цього дня — ВИХОДИМО БЕЗ ЗАПИТУ В API
-    if _tomorrow_global_published_for(tday):
+    # 1 запит+парс на весь бот
+    url, states = get_states_cached(API_TOMORROW)
+    if not url or not states:
         return
 
-    # Тут робимо один запит (бо ще не публікували)
-    url_t, intervals_by_row = get_intervals_by_row_cached(API_TOMORROW)
-    if not url_t or not intervals_by_row:
-        return
-
-    cur_hash = hash_intervals_by_row(intervals_by_row)
+    intervals_by_row = _parsed_cache.get(API_TOMORROW, {}).get("intervals_by_row")
+    if not intervals_by_row:
+        intervals_by_row = [intervals_from_states(r) for r in states]
 
     users = db_get_users_basic()
     if not users:
-        db_meta_set("tomorrow_published_day", tday)
-        db_meta_set("tomorrow_hash", cur_hash)
         return
 
-    label = tomorrow_label(now_dt)
-    sent = 0
+    sent_first = 0
+    sent_update = 0
     removed = 0
 
-    for chat_id, queue, subqueue, _, _ in users:
-        try:
-            row = _row_index(queue, subqueue)
-            full_intervals = intervals_by_row[row]
+    for chat_id, queue, subqueue, old_fp, old_states_txt, old_day in users:
+        row = _row_index(queue, subqueue)
+
+        row_states = states[row]
+        full_intervals = intervals_by_row[row]
+        new_fp = make_fingerprint(queue, subqueue, row_states)
+
+        # 1) якщо для користувача це новий tday — перша публікація
+        if old_day != tday:
             msg = f"📅 Завтра ({label})\n\n" + format_outages_by_dayparts_plain(full_intervals)
+            try:
+                await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb())
+                sent_first += 1
+            except Forbidden:
+                db_delete_user(chat_id)
+                removed += 1
+                continue
+            except Exception:
+                log.exception("Failed sending tomorrow first to chat_id=%s", chat_id)
+                continue
 
-            # ✅ записуємо TOMORROW-памʼять користувача (по його черзі)
-            states = _parsed_cache.get(API_TOMORROW, {}).get("states")
-            if states:
-                row_states = states[row]
-                fp = make_fingerprint(queue, subqueue, row_states)
-                db_set_tomorrow_memory(
-                    chat_id,
-                    tday,
-                    fp,
-                    total_off_minutes(full_intervals),
-                    intervals_to_text(full_intervals),
-                    states_to_text(row_states),
-                )
-            else:
-                # fallback: збережемо хоча б інтервали, fingerprint — як глобальний hash
-                db_set_tomorrow_memory(
-                    chat_id,
-                    tday,
-                    cur_hash,
-                    total_off_minutes(full_intervals),
-                    intervals_to_text(full_intervals),
-                    None,
-                )
+            db_set_tomorrow_memory(
+                chat_id, tday, new_fp,
+                total_off_minutes(full_intervals),
+                intervals_to_text(full_intervals),
+                states_to_text(row_states),
+            )
+            continue
 
-            await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb())
-            sent += 1
+        # 2) якщо нема з чим порівнювати — просто ініціалізуємо без пуша
+        if not old_fp:
+            db_set_tomorrow_memory(
+                chat_id, tday, new_fp,
+                total_off_minutes(full_intervals),
+                intervals_to_text(full_intervals),
+                states_to_text(row_states),
+            )
+            continue
 
-        except Forbidden:
-            log.warning("User blocked bot, removing chat_id=%s", chat_id)
-            db_delete_user(chat_id)
-            removed += 1
+        # 3) якщо fp не змінився — мовчимо
+        if old_fp == new_fp:
+            continue
 
-        except Exception:
-            log.exception("Failed sending tomorrow to chat_id=%s", chat_id)
-
-    # ✅ після успішної розсилки блокуємо подальші перевірки "завтра" (без API запитів)
-    db_meta_set("tomorrow_published_day", tday)
-    db_meta_set("tomorrow_hash", cur_hash)
-
-    log.info("Tomorrow first publish: sent=%d removed=%d total=%d day=%s", sent, removed, len(users), tday)
-
-
-async def check_tomorrow_update_2358(app: Application):
-    """
-    Вимога:
-    - о 23:58 робимо ОДИН запит на завтра
-    - якщо змінилось — присилаємо "графіки на завтра оновились"
-    """
-    if is_quiet_hours():
-        return
-
-    now_dt = datetime.now(TZ)
-    tday = tomorrow_day_str(now_dt)
-
-    # Якщо завтра ще не публікували — нема сенсу "оновлення" (воно буде першим publish)
-    if not _tomorrow_global_published_for(tday):
-        return
-
-    url_t, intervals_by_row = get_intervals_by_row_cached(API_TOMORROW)
-    if not url_t or not intervals_by_row:
-        return
-
-    cur_hash = hash_intervals_by_row(intervals_by_row)
-    last_hash = _tomorrow_global_hash()
-
-    if last_hash == cur_hash:
-        return
-
-    users = db_get_users_basic()
-    if not users:
-        db_meta_set("tomorrow_hash", cur_hash)
-        return
-
-    label = tomorrow_label(now_dt)
-    sent = 0
-    removed = 0
-
-    for chat_id, queue, subqueue, _, _ in users:
+        # 4) fp змінився — пушимо оновлення
+        msg = "🔄 Графіки на завтра оновились\n\n" + f"📅 Завтра ({label})\n\n" + format_outages_by_dayparts_plain(full_intervals)
         try:
-            row = _row_index(queue, subqueue)
-            full_intervals = intervals_by_row[row]
-            msg = "🔄 Графіки на завтра оновились\n\n" + f"📅 Завтра ({label})\n\n" + format_outages_by_dayparts_plain(full_intervals)
-
-            # оновлюємо TOMORROW-памʼять користувача
-            states = _parsed_cache.get(API_TOMORROW, {}).get("states")
-            if states:
-                row_states = states[row]
-                fp = make_fingerprint(queue, subqueue, row_states)
-                db_set_tomorrow_memory(
-                    chat_id,
-                    tday,
-                    fp,
-                    total_off_minutes(full_intervals),
-                    intervals_to_text(full_intervals),
-                    states_to_text(row_states),
-                )
-
             await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb())
-            sent += 1
-
+            sent_update += 1
         except Forbidden:
             db_delete_user(chat_id)
             removed += 1
+            continue
         except Exception:
-            log.exception("Failed sending tomorrow-update to chat_id=%s", chat_id)
+            log.exception("Failed sending tomorrow update to chat_id=%s", chat_id)
+            continue
 
-    db_meta_set("tomorrow_hash", cur_hash)
-    log.info("Tomorrow 23:58 update: sent=%d removed=%d total=%d day=%s", sent, removed, len(users), tday)
+        db_set_tomorrow_memory(
+            chat_id, tday, new_fp,
+            total_off_minutes(full_intervals),
+            intervals_to_text(full_intervals),
+            states_to_text(row_states),
+        )
 
+    log.info("Tomorrow poll: first=%d update=%d removed=%d total=%d day=%s",
+             sent_first, sent_update, removed, len(users), tday)
 
 async def broadcast_today_changes(app: Application):
     """
@@ -1544,8 +1478,8 @@ async def broadcast_today_changes(app: Application):
                     chat_id,
                     today,
                     fp,
-                    new_total_off,
-                    new_intervals_txt,
+                    total_off_minutes(full_intervals),
+                    intervals_to_text(full_intervals),
                     states_to_text(row_states),
                 )
 
@@ -1570,9 +1504,8 @@ async def post_init(app: Application):
         timezone=TZ,
     )
 
-    # publish "tomorrow" рівно один раз, як тільки з'явилось
     scheduler.add_job(
-        broadcast_tomorrow_first_publish,
+        broadcast_tomorrow_poll,
         "cron",
         hour="18-23",
         minute="*/5",
@@ -1580,20 +1513,10 @@ async def post_init(app: Application):
         timezone=TZ,
     )
 
-    # один контрольний запит на завтра о 23:58
-    scheduler.add_job(
-        check_tomorrow_update_2358,
-        "cron",
-        hour="23",
-        minute="58",
-        args=[app],
-        timezone=TZ,
-    )
-
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
     log.info(
-        "Scheduler started (today: 1/16/31/46, tomorrow-publish: 18-23 кожні 5 хв, tomorrow-check: 23:58)"
+        "Scheduler started (today: every 5 min, tomorrow: 18-23 every 5 min)"
     )
 
 
