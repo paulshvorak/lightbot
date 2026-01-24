@@ -3,3 +3,8 @@ cd /opt/lightbot/app
 git pull
 sudo systemctl start lightbot
 journalctl -u lightbot -n 20
+
+
+
+
+systemctl status lightbot.service

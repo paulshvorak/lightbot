@@ -53,8 +53,8 @@ V_THRESHOLD = 185
 # ================= QUIET HOURS =================
 # Тихі години для ПУШ-розсилок (scheduler jobs). Ручні кнопки/запити працюють як і раніше.
 # Інтервал: [start, end), тобто END не включно.
-QUIET_HOURS_START = 1   # 01:00
-QUIET_HOURS_END   = 7   # 07:00
+QUIET_HOURS_START = 0   # 00:00
+QUIET_HOURS_END   = 6   # 06:00
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("light_bot")
