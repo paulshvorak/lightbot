@@ -992,28 +992,47 @@ async def on_set_subqueue_button(update: Update, context: ContextTypes.DEFAULT_T
 
     db_upsert_user(chat_id, queue, subqueue)
 
-    # ініціалізуємо TODAY-памʼять (на поточний день), щоб не було "першого пуша"
+    # ✅ Одразу показати графік (сьогодні) для цієї черги
     try:
-        url, states = get_states_cached(API_TODAY)
+        url, states = await asyncio.to_thread(get_states_cached, API_TODAY)
+
         if url and states:
             row = _row_index(queue, subqueue)
             row_states = states[row]
-            fp = make_fingerprint(queue, subqueue, row_states)
-            intervals = intervals_from_states(row_states)
+            full_intervals = intervals_from_states(row_states)
 
-            today = day_str(datetime.now(TZ))
+            now_dt = datetime.now(TZ)
+            view_intervals = filter_past_intervals(full_intervals, now_dt)
+            now_has_light = is_light_now(full_intervals, now_dt)
+
+            text = (
+                f"✅ Збережено: черга {queue}/{subqueue}\n\n"
+                + format_outages_by_dayparts_today(view_intervals, now_has_light, now_dt, full_intervals)
+            )
+
+            # оновлюємо TODAY-памʼять, щоб не було “першого пуша”
+            today = day_str(now_dt)
+            fp = make_fingerprint(queue, subqueue, row_states)
             db_set_today_memory(
                 chat_id,
                 today,
                 fp,
-                total_off_minutes(intervals),
-                intervals_to_text(intervals),
+                total_off_minutes(full_intervals),
+                intervals_to_text(full_intervals),
                 states_to_text(row_states),
             )
-    except Exception:
-        log.exception("Failed to init today memory on set queue")
 
-    await q.edit_message_text(f"✅ Збережено: черга {queue}/{subqueue}\n\nМеню 👇", reply_markup=main_menu_kb())
+            await q.edit_message_text(text, reply_markup=main_menu_kb())
+            return
+
+    except Exception:
+        log.exception("Failed to show schedule right after set subqueue")
+
+    # fallback (якщо API недоступний)
+    await q.edit_message_text(
+        f"✅ Збережено: черга {queue}/{subqueue}\n\nМеню 👇",
+        reply_markup=main_menu_kb()
+    )
 
 
 async def on_menu_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
