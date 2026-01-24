@@ -720,11 +720,11 @@ def format_outages_by_dayparts_today(
     parts = {"🌙 Ніч": [], "☀️ День": [], "🌆 Вечір": []}
     for a, b in intervals:
         start = _to_minutes(a)
-        if start < 8 * 60:
+        if start < 6 * 60:          # 00:00–05:59
             parts["🌙 Ніч"].append((a, b))
-        elif start < 16 * 60:
+        elif start < 16 * 60:       # 06:00–15:59
             parts["☀️ День"].append((a, b))
-        else:
+        else:                       # 16:00–24:00
             parts["🌆 Вечір"].append((a, b))
 
     lines = [status, "", "🔌 Без світла:\n"]
