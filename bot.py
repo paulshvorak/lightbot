@@ -130,6 +130,9 @@ def _ensure_users_columns(con: sqlite3.Connection):
         "ALTER TABLE users ADD COLUMN tomorrow_total_off INTEGER",
         "ALTER TABLE users ADD COLUMN tomorrow_intervals TEXT",
         "ALTER TABLE users ADD COLUMN tomorrow_states TEXT",
+
+        # ✅ NEW: флаг, що юзер вже обрав чергу
+        "ALTER TABLE users ADD COLUMN is_configured INTEGER DEFAULT 0",
     ]
     for ddl in ddls:
         try:
@@ -167,11 +170,28 @@ def db_init():
                 tomorrow_fingerprint TEXT,
                 tomorrow_total_off INTEGER,
                 tomorrow_intervals TEXT,
-                tomorrow_states TEXT
+                tomorrow_states TEXT,
+
+                is_configured INTEGER DEFAULT 0
             )
         """)
 
         _ensure_users_columns(con)
+
+        # ✅ МІГРАЦІЯ is_configured ДЛЯ СТАРОЇ БАЗИ:
+        # ставимо configured=1 ТІЛЬКИ тим, у кого вже є збережений стан/памʼять
+        # (тобто це точно "старі реальні" юзери, а не нові, яких лише touchнули)
+        con.execute("""
+                    UPDATE users
+                    SET is_configured = 1
+                    WHERE COALESCE(is_configured, 0) = 0
+                      AND (
+                            today_fingerprint IS NOT NULL
+                         OR today_states IS NOT NULL
+                         OR last_fingerprint IS NOT NULL
+                         OR last_states IS NOT NULL
+                      )
+                """)
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS meta(
@@ -205,7 +225,7 @@ def db_touch_user(chat_id: int, username: Optional[str]):
                    NULL, NULL, NULL, NULL, NULL,
                    NULL, NULL, NULL, NULL, NULL)
             ON CONFLICT(chat_id) DO UPDATE SET
-                username=excluded.username,
+                username = COALESCE(excluded.username, users.username),
                 last_seen_at=excluded.last_seen_at,
                 created_at=COALESCE(users.created_at, excluded.created_at)
         """, (chat_id, username, now_ts, now_ts))
@@ -214,55 +234,60 @@ def db_touch_user(chat_id: int, username: Optional[str]):
 
 def db_upsert_user(chat_id: int, queue: int, subqueue: int):
     """
-    Оновлює чергу/підчергу.
+    Оновлює чергу/підчергу + позначає юзера як сконфігурованого.
     """
     with db_connect() as con:
         _ensure_users_columns(con)
         con.execute("""
             INSERT INTO users(
-                chat_id, queue, subqueue,
+                chat_id, queue, subqueue, is_configured,
                 last_fingerprint, last_total_off, last_intervals, last_states,
                 today_day, today_fingerprint, today_total_off, today_intervals, today_states,
                 tomorrow_day, tomorrow_fingerprint, tomorrow_total_off, tomorrow_intervals, tomorrow_states
             )
-            VALUES(?, ?, ?,
+            VALUES(?, ?, ?, 1,
                    NULL, NULL, NULL, NULL,
                    NULL, NULL, NULL, NULL, NULL,
                    NULL, NULL, NULL, NULL, NULL)
             ON CONFLICT(chat_id) DO UPDATE
             SET queue=excluded.queue,
-                subqueue=excluded.subqueue
+                subqueue=excluded.subqueue,
+                is_configured=1
         """, (chat_id, queue, subqueue))
         con.commit()
 
+def db_is_configured(chat_id: int) -> bool:
+    with db_connect() as con:
+        _ensure_users_columns(con)
+        cur = con.execute(
+            "SELECT COALESCE(is_configured, 0) FROM users WHERE chat_id=?",
+            (chat_id,)
+        )
+        row = cur.fetchone()
+        return bool(row and row[0] == 1)
+
+
 
 def db_get_users_for_push() -> List[Tuple[int, int, int, Optional[str], Optional[int], Optional[str], Optional[str], Optional[str]]]:
-    """
-    Для today-changes пушів:
-    Повертає:
-      (chat_id, queue, subqueue, today_fingerprint, today_total_off, today_intervals, today_states, today_day)
-    """
     with db_connect() as con:
         _ensure_users_columns(con)
         cur = con.execute("""
             SELECT chat_id, queue, subqueue,
                    today_fingerprint, today_total_off, today_intervals, today_states, today_day
             FROM users
+            WHERE COALESCE(is_configured, 0) = 1
         """)
         return list(cur.fetchall())
 
 
 def db_get_users_basic() -> List[Tuple[int, int, int, Optional[str], Optional[str], Optional[str]]]:
-    """
-    Для tomorrow-розсилок:
-      (chat_id, queue, subqueue, tomorrow_fingerprint, tomorrow_states, tomorrow_day)
-    """
     with db_connect() as con:
         _ensure_users_columns(con)
         cur = con.execute("""
             SELECT chat_id, queue, subqueue,
                    tomorrow_fingerprint, tomorrow_states, tomorrow_day
             FROM users
+            WHERE COALESCE(is_configured, 0) = 1
         """)
         return list(cur.fetchall())
 
@@ -270,7 +295,11 @@ def db_get_users_basic() -> List[Tuple[int, int, int, Optional[str], Optional[st
 def db_get_user_queue(chat_id: int) -> Optional[Tuple[int, int]]:
     with db_connect() as con:
         _ensure_users_columns(con)
-        cur = con.execute("SELECT queue, subqueue FROM users WHERE chat_id=?", (chat_id,))
+        cur = con.execute("""
+            SELECT queue, subqueue
+            FROM users
+            WHERE chat_id=? AND COALESCE(is_configured, 0) = 1
+        """, (chat_id,))
         row = cur.fetchone()
         if not row:
             return None
@@ -857,6 +886,12 @@ def _cooldown_left(last_ts: float, cooldown: int) -> int:
 
 # ================= UI (BUTTONS) =================
 
+def first_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ Встановити чергу", callback_data="menu:set")],
+    ])
+
+
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Встановити/змінити чергу", callback_data="menu:set")],
@@ -901,7 +936,15 @@ _last_tomorrow: dict[int, float] = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_from_update(update)
-    await update.message.reply_text("Меню", reply_markup=main_menu_kb())
+
+    chat_id = update.effective_chat.id
+    if db_is_configured(chat_id):
+        await update.message.reply_text("Меню", reply_markup=main_menu_kb())
+    else:
+        await update.message.reply_text(
+            "Привіт! Спочатку обери свою чергу 👇",
+            reply_markup=first_menu_kb()
+        )
 
 
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1273,10 +1316,20 @@ async def on_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_from_update(update)
     q = update.callback_query
     await q.answer()
+
+    chat_id = q.message.chat_id
+
+    if db_is_configured(chat_id):
+        kb = main_menu_kb()
+        text = "Меню 👇"
+    else:
+        kb = first_menu_kb()
+        text = "Спочатку обери чергу 👇"
+
     try:
-        await q.edit_message_text("Меню 👇", reply_markup=main_menu_kb())
+        await q.edit_message_text(text, reply_markup=kb)
     except Exception:
-        await q.edit_message_reply_markup(reply_markup=main_menu_kb())
+        await q.edit_message_reply_markup(reply_markup=kb)
 
 
 # ================= SCHEDULER JOBS =================
