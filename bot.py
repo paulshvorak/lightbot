@@ -381,6 +381,30 @@ def touch_from_update(update: Update) -> None:
     except Exception:
         log.exception("touch_from_update failed")
 
+def db_users_stats_by_day(days: int = 14) -> tuple[int, list[tuple[str, int]]]:
+    """
+    Повертає:
+    - total_users
+    - список (day, count) за останні N днів
+    """
+    with db_connect() as con:
+        total = con.execute(
+            "SELECT COUNT(*) FROM users WHERE created_at IS NOT NULL"
+        ).fetchone()[0]
+
+        rows = con.execute("""
+            SELECT
+              date(created_at, 'unixepoch', 'localtime') AS day,
+              COUNT(*) AS cnt
+            FROM users
+            WHERE created_at IS NOT NULL
+              AND created_at >= strftime('%s','now', ?)
+            GROUP BY day
+            ORDER BY day DESC
+        """, (f"-{days} days",)).fetchall()
+
+    return int(total), [(day, int(cnt)) for day, cnt in rows]
+
 
 # ================= QUIET HOURS HELPERS =================
 
@@ -1015,6 +1039,34 @@ async def admin_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"last_seen_at: {fmt_ts(last_seen_at)}"
     )
 
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_from_update(update)
+
+    u = update.effective_user
+    if not u or u.id not in ADMIN_IDS:
+        return
+
+    total, by_days = db_users_stats_by_day(days=14)
+
+    lines = [
+        "📊 Статистика користувачів",
+        "",
+        f"👥 Всього користувачів: {total}",
+        "",
+        "📅 Нові по днях (останні 14 днів):",
+    ]
+
+    if not by_days:
+        lines.append("— немає даних —")
+    else:
+        for day, cnt in by_days:
+            lines.append(f"{day}: {cnt}")
+
+    text = "\n".join(lines)
+
+    await update.message.reply_text(text)
+
+
 def build_users_table(rows: list[tuple[int, str, Optional[int]]]) -> str:
     """
     rows: (chat_id, username, last_seen_at)
@@ -1610,6 +1662,7 @@ def main():
     app.add_handler(CommandHandler("say", admin_say))
     app.add_handler(CommandHandler("last", admin_last))
     app.add_handler(CommandHandler("users", admin_users))
+    app.add_handler(CommandHandler("stats", admin_stats))
 
     app.add_handler(CallbackQueryHandler(on_menu_set, pattern=r"^menu:set$"))
     app.add_handler(CallbackQueryHandler(on_menu_now, pattern=r"^menu:now$"))
