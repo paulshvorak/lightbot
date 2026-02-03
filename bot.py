@@ -1597,6 +1597,52 @@ async def broadcast_today_changes(app: Application):
         log.exception("broadcast(today) failed")
 
 
+async def seed_today_baseline(app: Application):
+    """
+    О 00:00 робимо "тихий baseline" на сьогодні:
+    - НЕ шлемо пуші
+    - просто записуємо today_* для всіх сконфігурованих юзерів
+    """
+    now_dt = datetime.now(TZ)
+    today = day_str(now_dt)
+
+    users = db_get_users_for_push()  # тут є chat_id, queue, subqueue ...
+    if not users:
+        return
+
+    try:
+        url, states = get_states_cached(API_TODAY)
+        if not url or not states:
+            log.warning("seed_today_baseline: no states/url")
+            return
+
+        intervals_by_row = _parsed_cache.get(API_TODAY, {}).get("intervals_by_row")
+        if not intervals_by_row:
+            intervals_by_row = [intervals_from_states(r) for r in states]
+
+        updated = 0
+        for chat_id, queue, subqueue, last_fp, last_total_off, last_intervals_txt, last_states_txt, last_day in users:
+            row = _row_index(queue, subqueue)
+            row_states = states[row]
+            fp = make_fingerprint(queue, subqueue, row_states)
+            full_intervals = intervals_by_row[row]
+
+            db_set_today_memory(
+                chat_id,
+                today,
+                fp,
+                total_off_minutes(full_intervals),
+                intervals_to_text(full_intervals),
+                states_to_text(row_states),
+            )
+            updated += 1
+
+        log.info("seed_today_baseline: updated=%d day=%s", updated, today)
+
+    except Exception:
+        log.exception("seed_today_baseline failed")
+
+
 async def post_init(app: Application):
     scheduler = AsyncIOScheduler(timezone=TZ)
 
@@ -1623,6 +1669,17 @@ async def post_init(app: Application):
     log.info(
         "Scheduler started (today: every 5 min, tomorrow: 18-23 every 5 min)"
     )
+
+    # ✅ тихий baseline для today о 00:01 (щоб після 06:00 був з чим порівнювати)
+    scheduler.add_job(
+        seed_today_baseline,
+        "cron",
+        hour=0,
+        minute=1,
+        args=[app],
+        timezone=TZ,
+    )
+
 
 
 # ================= ERROR HANDLER =================
