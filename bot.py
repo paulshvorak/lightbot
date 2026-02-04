@@ -1670,12 +1670,12 @@ async def post_init(app: Application):
         "Scheduler started (today: every 5 min, tomorrow: 18-23 every 5 min)"
     )
 
-    # ✅ тихий baseline для today о 00:01 (щоб після 06:00 був з чим порівнювати)
+    # ✅ тихий baseline для today о 00:30 (щоб після 06:00 був з чим порівнювати)
     scheduler.add_job(
         seed_today_baseline,
         "cron",
         hour=0,
-        minute=1,
+        minute=30,
         args=[app],
         timezone=TZ,
     )
