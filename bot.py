@@ -35,6 +35,10 @@ API_BASE = "https://api-voe-poweron.inneti.net"
 API_TODAY = f"{API_BASE}/api/options?option_key=pw_gpv_image_today"
 API_TOMORROW = f"{API_BASE}/api/options?option_key=pw_gpv_image_tomorrow"
 
+TEST_MODE = os.getenv("TEST_MODE", "0") == "1"
+TEST_TODAY_IMAGE = os.getenv("TEST_TODAY_IMAGE", "./test_images/today.png")
+TEST_TOMORROW_IMAGE = os.getenv("TEST_TOMORROW_IMAGE", "./test_images/tomorrow.png")
+
 DB_PATH = os.getenv("DB_PATH", "users.db")
 
 TZ = ZoneInfo("Europe/Uzhgorod")
@@ -449,6 +453,11 @@ def download_image(url: str) -> np.ndarray:
         raise RuntimeError("Не вдалося декодувати зображення")
     return img
 
+def load_local_image(path: str) -> np.ndarray:
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError(f"Не вдалося прочитати локальне зображення: {path}")
+    return img
 
 # ================= CACHES (per endpoint) =================
 
@@ -464,6 +473,30 @@ _parsed_cache: Dict[str, Dict[str, Any]] = {
 
 
 def get_image_cached(api_url: str) -> Tuple[Optional[str], Optional[np.ndarray]]:
+    # ✅ TEST MODE: беремо з диска і не ходимо в мережу
+    if TEST_MODE:
+        path = TEST_TODAY_IMAGE if api_url == API_TODAY else TEST_TOMORROW_IMAGE
+        # "url" тут просто маркер, щоб кеш/парсер розумів "версію"
+        # робимо fingerprint по mtime, щоб при заміні файлу вважалося "оновленням"
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None, None
+
+        fake_url = f"file:{os.path.abspath(path)}?v={int(mtime)}"
+
+        # кеш TTL можна зберегти, але для тестів зручніше реагувати на зміну файлу
+        c = _cached_img.setdefault(api_url, {"ts": 0.0, "url": None, "img": None})
+        if c["img"] is not None and c["url"] == fake_url and (time.time() - c["ts"]) < CACHE_TTL_SEC:
+            return c["url"], c["img"]
+
+        img = load_local_image(path)
+        c["ts"] = time.time()
+        c["url"] = fake_url
+        c["img"] = img
+        return fake_url, img
+
+    # ✅ PROD MODE: як було
     now = time.time()
     c = _cached_img.setdefault(api_url, {"ts": 0.0, "url": None, "img": None})
 
@@ -1127,6 +1160,63 @@ async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"<pre>{text}</pre>", parse_mode="HTML")
 
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_from_update(update)
+
+    u = update.effective_user
+    if not u or u.id not in ADMIN_IDS:
+        return
+
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Використання: /broadcast <текст>")
+        return
+
+    with db_connect() as con:
+        _ensure_users_columns(con)
+        rows = con.execute("""
+            SELECT chat_id
+            FROM users
+            WHERE COALESCE(is_configured, 0) = 1
+        """).fetchall()
+
+    if not rows:
+        await update.message.reply_text("Немає користувачів для розсилки.")
+        return
+
+    total = len(rows)
+    sent = 0
+    removed = 0
+    failed = 0
+
+    await update.message.reply_text(f"📣 Починаю розсилку на {total} користувачів...")
+
+    for (chat_id,) in rows:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=main_menu_kb()
+            )
+            sent += 1
+
+        except Forbidden:
+            db_delete_user(chat_id)
+            removed += 1
+
+        except Exception:
+            log.exception("broadcast failed for chat_id=%s", chat_id)
+            failed += 1
+
+        # невелика пауза, щоб не впертися у flood limits
+        await asyncio.sleep(0.05)
+
+    await update.message.reply_text(
+        "✅ Розсилка завершена\n"
+        f"Надіслано: {sent}\n"
+        f"Видалено з бази: {removed}\n"
+        f"Помилок: {failed}"
+    )
 
 async def on_menu_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_from_update(update)
@@ -1720,6 +1810,7 @@ def main():
     app.add_handler(CommandHandler("last", admin_last))
     app.add_handler(CommandHandler("users", admin_users))
     app.add_handler(CommandHandler("stats", admin_stats))
+    app.add_handler(CommandHandler("broadcast", admin_broadcast))
 
     app.add_handler(CallbackQueryHandler(on_menu_set, pattern=r"^menu:set$"))
     app.add_handler(CallbackQueryHandler(on_menu_now, pattern=r"^menu:now$"))
