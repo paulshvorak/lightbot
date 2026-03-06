@@ -1167,10 +1167,19 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u or u.id not in ADMIN_IDS:
         return
 
-    text = " ".join(context.args).strip()
-    if not text:
+    if not update.message or not update.message.text:
         await update.message.reply_text("Використання: /broadcast <текст>")
         return
+
+    # беремо весь текст після команди, зі всіма переносами рядків
+    full_text = update.message.text
+    parts = full_text.split(maxsplit=1)
+
+    if len(parts) < 2:
+        await update.message.reply_text("Використання: /broadcast <текст>")
+        return
+
+    text = parts[1]
 
     with db_connect() as con:
         _ensure_users_columns(con)
@@ -1208,7 +1217,6 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.exception("broadcast failed for chat_id=%s", chat_id)
             failed += 1
 
-        # невелика пауза, щоб не впертися у flood limits
         await asyncio.sleep(0.05)
 
     await update.message.reply_text(
