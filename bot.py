@@ -1168,13 +1168,9 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not update.message or not update.message.text:
-        await update.message.reply_text("Використання: /broadcast <текст>")
         return
 
-    # беремо весь текст після команди, зі всіма переносами рядків
-    full_text = update.message.text
-    parts = full_text.split(maxsplit=1)
-
+    parts = update.message.text.split(maxsplit=1)
     if len(parts) < 2:
         await update.message.reply_text("Використання: /broadcast <текст>")
         return
@@ -1193,12 +1189,9 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Немає користувачів для розсилки.")
         return
 
-    total = len(rows)
     sent = 0
     removed = 0
     failed = 0
-
-    await update.message.reply_text(f"📣 Починаю розсилку на {total} користувачів...")
 
     for (chat_id,) in rows:
         try:
@@ -1208,11 +1201,9 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_menu_kb()
             )
             sent += 1
-
         except Forbidden:
             db_delete_user(chat_id)
             removed += 1
-
         except Exception:
             log.exception("broadcast failed for chat_id=%s", chat_id)
             failed += 1
@@ -1220,9 +1211,9 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.05)
 
     await update.message.reply_text(
-        "✅ Розсилка завершена\n"
+        f"✅ Розсилка завершена\n"
         f"Надіслано: {sent}\n"
-        f"Видалено з бази: {removed}\n"
+        f"Видалено: {removed}\n"
         f"Помилок: {failed}"
     )
 
