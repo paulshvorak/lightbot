@@ -1019,23 +1019,52 @@ async def admin_say(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u or u.id not in ADMIN_IDS:
         return
 
-    if len(context.args) < 2:
-        await update.message.reply_text("Використання: /say <chat_id> <текст>")
+    if not update.message or not update.message.text:
+        return
+
+    parts = update.message.text.split(maxsplit=2)
+
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Використання:\n"
+            "/say <chat_id> <текст>\n"
+            "або reply на повідомлення командою:\n"
+            "/say <chat_id>"
+        )
         return
 
     try:
-        chat_id = int(context.args[0])
+        chat_id = int(parts[1])
     except ValueError:
-        await update.message.reply_text("chat_id має бути числом. Приклад: /say 123456789 Привіт")
+        await update.message.reply_text("chat_id має бути числом. Приклад: /say 123456789")
         return
 
-    text = " ".join(context.args[1:]).strip()
+    text = None
+
+    # 1) пріоритет: reply на повідомлення
+    if update.message.reply_to_message:
+        reply_msg = update.message.reply_to_message
+        text = reply_msg.text or reply_msg.caption
+
+    # 2) fallback: текст після chat_id
+    if not text and len(parts) >= 3:
+        text = parts[2]
+
     if not text:
-        await update.message.reply_text("Текст не може бути порожнім.")
+        await update.message.reply_text(
+            "Немає тексту для надсилання.\n"
+            "Варіанти:\n"
+            "1) /say <chat_id> <текст>\n"
+            "2) reply на повідомлення командою /say <chat_id>"
+        )
         return
 
     try:
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=main_menu_kb())
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=main_menu_kb()
+        )
         await update.message.reply_text(f"✅ Надіслано в chat_id={chat_id}")
     except Forbidden:
         await update.message.reply_text("❌ Не можу надіслати: користувач заблокував бота або чат недоступний.")
@@ -1170,12 +1199,27 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    parts = update.message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await update.message.reply_text("Використання: /broadcast <текст>")
-        return
+    text = None
 
-    text = parts[1]
+    # 1) пріоритет: reply на повідомлення
+    if update.message.reply_to_message:
+        reply_msg = update.message.reply_to_message
+        text = reply_msg.text or reply_msg.caption
+
+    # 2) fallback: текст після /broadcast
+    if not text:
+        parts = update.message.text.split(maxsplit=1)
+        if len(parts) >= 2:
+            text = parts[1]
+
+    if not text:
+        await update.message.reply_text(
+            "Використання:\n"
+            "/broadcast <текст>\n"
+            "або reply на повідомлення командою:\n"
+            "/broadcast"
+        )
+        return
 
     with db_connect() as con:
         _ensure_users_columns(con)
@@ -1189,9 +1233,12 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Немає користувачів для розсилки.")
         return
 
+    total = len(rows)
     sent = 0
     removed = 0
     failed = 0
+
+    await update.message.reply_text(f"📣 Починаю розсилку на {total} користувачів...")
 
     for (chat_id,) in rows:
         try:
@@ -1211,9 +1258,9 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.05)
 
     await update.message.reply_text(
-        f"✅ Розсилка завершена\n"
+        "✅ Розсилка завершена\n"
         f"Надіслано: {sent}\n"
-        f"Видалено: {removed}\n"
+        f"Видалено з бази: {removed}\n"
         f"Помилок: {failed}"
     )
 
@@ -1806,10 +1853,10 @@ def main():
 
     app.add_handler(CommandHandler("id", my_id))
     app.add_handler(CommandHandler("say", admin_say))
+    app.add_handler(CommandHandler("broadcast", admin_broadcast))
     app.add_handler(CommandHandler("last", admin_last))
     app.add_handler(CommandHandler("users", admin_users))
     app.add_handler(CommandHandler("stats", admin_stats))
-    app.add_handler(CommandHandler("broadcast", admin_broadcast))
 
     app.add_handler(CallbackQueryHandler(on_menu_set, pattern=r"^menu:set$"))
     app.add_handler(CallbackQueryHandler(on_menu_now, pattern=r"^menu:now$"))
