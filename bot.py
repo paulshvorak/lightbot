@@ -1556,6 +1556,16 @@ async def broadcast_tomorrow_poll(app: Application):
 
         # 1) якщо для користувача це новий tday — перша публікація
         if old_day != tday:
+            # якщо відключень немає — мовчимо, але зберігаємо стан
+            if not full_intervals:
+                db_set_tomorrow_memory(
+                    chat_id, tday, new_fp,
+                    0,
+                    "",
+                    states_to_text(row_states),
+                )
+                continue
+
             msg = f"📅 Завтра ({label})\n\n" + format_outages_by_dayparts_plain(full_intervals)
             try:
                 await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb())
