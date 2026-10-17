@@ -61,7 +61,7 @@ def time_to_light(intervals: List[Tuple[str, str]], now_dt: datetime) -> Optiona
                 parts.append(f"{h} год")
             if m > 0:
                 parts.append(f"{m} хв")
-            return "ввімкнеться через " + " ".join(parts)
+            return "ще " + " ".join(parts)
     return None
 
 
@@ -171,7 +171,7 @@ def format_outages_by_dayparts_today(
         status = "💡 Зараз є світло"
     else:
         eta = time_to_light(full_intervals, now_dt)
-        status = f"❌ Зараз немає світла ({eta})" if eta else "❌ Зараз немає світла"
+        status = f"❌ Немає світла ({eta})" if eta else "❌ Немає світла"
 
     if not intervals:
         return f"{status}\n🎉 Відключень більше не бачу"

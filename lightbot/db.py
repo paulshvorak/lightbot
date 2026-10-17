@@ -36,6 +36,19 @@ class Subscription:
     tomorrow_states: Optional[str]
 
 
+class _AutoCloseConnection(sqlite3.Connection):
+    """
+    sqlite3.Connection.__exit__ сам по собі лише commit/rollback — з'єднання
+    НЕ закривається. Тут додатково закриваємо його, щоб `with db_connect() as con:`
+    не лишало відкритий файловий дескриптор після кожного виклику.
+    """
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self.close()
+
+
 def db_connect() -> sqlite3.Connection:
     """
     Єдине місце для підключення до SQLite з корисними PRAGMA:
@@ -43,7 +56,7 @@ def db_connect() -> sqlite3.Connection:
     - busy_timeout: менше шансів на "database is locked"
     - row_factory=Row: доступ до колонок за іменем, без tuple-позицій
     """
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, factory=_AutoCloseConnection)
     con.row_factory = sqlite3.Row
     try:
         con.execute("PRAGMA journal_mode=WAL")
@@ -150,13 +163,15 @@ def db_add_subscription(chat_id: int, queue: int, subqueue: int):
         con.commit()
 
 
-def db_set_subscription_label(chat_id: int, queue: int, subqueue: int, label: Optional[str]):
+def db_set_subscription_label(chat_id: int, queue: int, subqueue: int, label: Optional[str]) -> bool:
+    """Повертає True, якщо підписка існувала і назву дійсно оновлено."""
     with db_connect() as con:
-        con.execute(
+        cur = con.execute(
             "UPDATE subscriptions SET label=? WHERE chat_id=? AND queue=? AND subqueue=?",
             (label, chat_id, queue, subqueue)
         )
         con.commit()
+        return cur.rowcount > 0
 
 
 def db_remove_subscription(chat_id: int, queue: int, subqueue: int):

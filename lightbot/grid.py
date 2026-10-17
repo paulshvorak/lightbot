@@ -1,4 +1,5 @@
 import hashlib
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -109,38 +110,48 @@ _parsed_cache: Dict[str, Dict[str, Any]] = {
     API_TOMORROW: {"ts": 0.0, "url": None, "states": None, "intervals_by_row": None},
 }
 
+# _parsed_cache читається/пишеться і з event-loop треду (scheduler),
+# і з worker-тредів asyncio.to_thread (хендлери) — потрібне блокування.
+# RLock, бо get_intervals_by_row_cached викликає get_states_cached зсередини.
+_parsed_cache_lock = threading.RLock()
+
 
 def get_states_cached(api_url: str) -> Tuple[Optional[str], Optional[List[List[bool]]]]:
     """
     Парсить (або віддає з кешу) матрицю states 12x48.
     """
     now = time.time()
-    pc = _parsed_cache.setdefault(api_url, {"ts": 0.0, "url": None, "states": None, "intervals_by_row": None})
 
-    if pc["states"] is not None and pc["url"] is not None and (now - pc["ts"]) < PARSE_TTL_SEC:
-        return pc["url"], pc["states"]
+    with _parsed_cache_lock:
+        pc = _parsed_cache.setdefault(api_url, {"ts": 0.0, "url": None, "states": None, "intervals_by_row": None})
+        if pc["states"] is not None and pc["url"] is not None and (now - pc["ts"]) < PARSE_TTL_SEC:
+            return pc["url"], pc["states"]
 
     try:
         url, img = get_image_cached(api_url)
         if not url or img is None:
             return None, None
 
-        if pc["states"] is not None and pc["url"] == url and (now - pc["ts"]) < PARSE_TTL_SEC:
-            return url, pc["states"]
+        with _parsed_cache_lock:
+            pc = _parsed_cache[api_url]
+            if pc["states"] is not None and pc["url"] == url and (now - pc["ts"]) < PARSE_TTL_SEC:
+                return url, pc["states"]
 
-        states = read_all_rows_states(img, GRID)
-        intervals_by_row = [intervals_from_states(r) for r in states]
+            states = read_all_rows_states(img, GRID)
+            intervals_by_row = [intervals_from_states(r) for r in states]
 
-        pc["ts"] = now
-        pc["url"] = url
-        pc["states"] = states
-        pc["intervals_by_row"] = intervals_by_row
-        return url, states
+            pc["ts"] = now
+            pc["url"] = url
+            pc["states"] = states
+            pc["intervals_by_row"] = intervals_by_row
+            return url, states
 
     except requests.exceptions.RequestException as e:
-        if pc["states"] is not None and pc["url"] is not None:
-            log.warning("Network error, using cached states for %s: %s", api_url, e)
-            return pc["url"], pc["states"]
+        with _parsed_cache_lock:
+            pc = _parsed_cache[api_url]
+            if pc["states"] is not None and pc["url"] is not None:
+                log.warning("Network error, using cached states for %s: %s", api_url, e)
+                return pc["url"], pc["states"]
 
         log.warning("Network error, no cache available for %s: %s", api_url, e)
         return None, None
@@ -151,16 +162,18 @@ def get_intervals_by_row_cached(api_url: str) -> Tuple[Optional[str], Optional[L
     Кешований доступ до інтервалів для всіх 12 рядків.
     """
     now = time.time()
-    pc = _parsed_cache.setdefault(api_url, {"ts": 0.0, "url": None, "states": None, "intervals_by_row": None})
 
-    if pc.get("intervals_by_row") is not None and pc.get("url") is not None and (now - pc["ts"]) < PARSE_TTL_SEC:
-        return pc["url"], pc["intervals_by_row"]
+    with _parsed_cache_lock:
+        pc = _parsed_cache.setdefault(api_url, {"ts": 0.0, "url": None, "states": None, "intervals_by_row": None})
+        if pc.get("intervals_by_row") is not None and pc.get("url") is not None and (now - pc["ts"]) < PARSE_TTL_SEC:
+            return pc["url"], pc["intervals_by_row"]
 
     url, states = get_states_cached(api_url)
     if not url or not states:
         return None, None
 
-    if pc.get("intervals_by_row") is None:
-        pc["intervals_by_row"] = [intervals_from_states(r) for r in states]
-
-    return pc["url"], pc["intervals_by_row"]
+    with _parsed_cache_lock:
+        pc = _parsed_cache[api_url]
+        if pc.get("intervals_by_row") is None:
+            pc["intervals_by_row"] = [intervals_from_states(r) for r in states]
+        return pc["url"], pc["intervals_by_row"]

@@ -41,7 +41,14 @@ from ..keyboards import after_add_kb, all_queues_kb, first_menu_kb, main_menu_kb
 # ================= TELEGRAM HANDLERS (user-facing) =================
 
 _last_now: dict[int, float] = {}
+_LAST_NOW_TTL_SEC = 3600  # набагато більше за кулдаун — просто щоб не накопичувалось вічно
 MAX_LABEL_LEN = 24
+
+
+def _prune_last_now(now: float) -> None:
+    stale = [chat_id for chat_id, ts in _last_now.items() if now - ts > _LAST_NOW_TTL_SEC]
+    for chat_id in stale:
+        del _last_now[chat_id]
 
 
 async def _safe_answer(q: CallbackQuery, text: Optional[str] = None, show_alert: bool = False) -> None:
@@ -105,6 +112,7 @@ async def on_menu_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_sub_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_from_update(update)
+    context.user_data.pop("awaiting_label", None)
     q = update.callback_query
     await _safe_answer(q)
 
@@ -116,6 +124,7 @@ async def on_sub_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_add_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_from_update(update)
+    context.user_data.pop("awaiting_label", None)
     q = update.callback_query
 
     _, _, queue_s, subqueue_s = q.data.split(":")
@@ -175,6 +184,7 @@ async def on_add_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_sub_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_from_update(update)
+    context.user_data.pop("awaiting_label", None)
     q = update.callback_query
     await _safe_answer(q)
 
@@ -240,6 +250,7 @@ async def on_menu_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_answer(q, f"⏳ Зачекай {left}с")
         return
     _last_now[chat_id] = t
+    _prune_last_now(t)
 
     subs = db_get_subscriptions(chat_id)
     if not subs:

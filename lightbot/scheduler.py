@@ -1,3 +1,4 @@
+import asyncio
 import html
 from datetime import datetime
 
@@ -40,8 +41,8 @@ async def broadcast_tomorrow_poll(app: Application):
     tday = tomorrow_day_str(now_dt)
     label = tomorrow_label(now_dt)
 
-    # 1 запит+парс на весь бот
-    url, states = get_states_cached(API_TOMORROW)
+    # 1 запит+парс на весь бот (не блокуємо event loop)
+    url, states = await asyncio.to_thread(get_states_cached, API_TOMORROW)
     if not url or not states:
         return
 
@@ -155,7 +156,7 @@ async def broadcast_today_changes(app: Application):
     today = day_str(now_dt)
 
     try:
-        url, states = get_states_cached(API_TODAY)
+        url, states = await asyncio.to_thread(get_states_cached, API_TODAY)
         if not url or not states:
             return
 
@@ -255,7 +256,7 @@ async def seed_today_baseline(app: Application):
         return
 
     try:
-        url, states = get_states_cached(API_TODAY)
+        url, states = await asyncio.to_thread(get_states_cached, API_TODAY)
         if not url or not states:
             log.warning("seed_today_baseline: no states/url")
             return
