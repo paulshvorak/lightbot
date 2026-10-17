@@ -7,22 +7,23 @@ from .config import TZ
 # ================= FORMATTING =================
 
 
+def subscription_display_name(queue: int, subqueue: int, label: Optional[str]) -> str:
+    """Повна назва з номером — для налаштувань (список черг, підтвердження перейменування)."""
+    if label:
+        return f"{label} ({queue}.{subqueue})"
+    return f"Черга {queue}.{subqueue}"
+
+
+def subscription_short_name(queue: int, subqueue: int, label: Optional[str]) -> str:
+    """Коротка назва без номера — для повідомлень (пуші, "Зараз"), якщо назва задана."""
+    if label:
+        return label
+    return f"Черга {queue}.{subqueue}"
+
+
 def _to_minutes(t: str) -> int:
     h, m = map(int, t.split(":"))
     return h * 60 + m
-
-
-def _fmt_duration_ua(minutes: int) -> str:
-    h = minutes // 60
-    m = minutes % 60
-    parts = []
-    if h > 0:
-        parts.append(f"{h} год")
-    if m > 0:
-        parts.append(f"{m} хв")
-    if not parts:
-        return "0 хв"
-    return " ".join(parts)
 
 
 def total_off_minutes(intervals: List[Tuple[str, str]]) -> int:
@@ -34,36 +35,6 @@ def total_off_minutes(intervals: List[Tuple[str, str]]) -> int:
 
 def intervals_to_text(intervals: List[Tuple[str, str]]) -> str:
     return ";".join([f"{a}-{b}" for a, b in intervals])
-
-
-def build_update_prefix(
-    old_total_off: Optional[int],
-    old_intervals_text: Optional[str],
-    new_total_off: int,
-    new_intervals_text: str,
-) -> str:
-    header = "🔄 Графік оновлено для твоєї черги"
-
-    lines = [header, ""]
-    delta_line = None
-
-    if old_total_off is not None:
-        delta = new_total_off - old_total_off
-        if delta > 0:
-            delta_line = f"❌ Світла стало МЕНШЕ на {_fmt_duration_ua(delta)}"
-        elif delta < 0:
-            delta_line = f"✅ Світла стало БІЛЬШЕ на {_fmt_duration_ua(abs(delta))}"
-        else:
-            delta_line = "➖ Кількість світла не змінилась"
-
-    if old_total_off is None and old_intervals_text is None:
-        lines.append("ℹ️ Оновили графік — показую актуальний стан")
-        return "\n".join(lines).strip()
-
-    if delta_line:
-        lines.append(delta_line)
-
-    return "\n".join(lines).strip()
 
 
 def is_light_now(intervals: List[Tuple[str, str]], now_dt: datetime) -> bool:
@@ -190,12 +161,6 @@ def diff_future_intervals(
     return cancelled, added
 
 
-def fmt_interval_lines(intervals: List[Tuple[str, str]], prefix: str) -> str:
-    if not intervals:
-        return "—"
-    return "\n".join([f"{prefix} {a}–{b}" for a, b in intervals])
-
-
 def format_outages_by_dayparts_today(
     intervals: List[Tuple[str, str]],
     now_has_light: bool,
@@ -209,50 +174,17 @@ def format_outages_by_dayparts_today(
         status = f"❌ Зараз немає світла ({eta})" if eta else "❌ Зараз немає світла"
 
     if not intervals:
-        return f"{status}\n\n🎉 Відключень більше не бачу"
+        return f"{status}\n🎉 Відключень більше не бачу"
 
-    parts = {"🌙 Ніч": [], "☀️ День": [], "🌆 Вечір": []}
-    for a, b in intervals:
-        start = _to_minutes(a)
-        if start < 6 * 60:          # 00:00–05:59
-            parts["🌙 Ніч"].append((a, b))
-        elif start < 16 * 60:       # 06:00–15:59
-            parts["☀️ День"].append((a, b))
-        else:                       # 16:00–24:00
-            parts["🌆 Вечір"].append((a, b))
-
-    lines = [status, "", "🔌 Без світла:\n"]
-    for title in ["🌙 Ніч", "☀️ День", "🌆 Вечір"]:
-        if parts[title]:
-            lines.append(title)
-            for a, b in parts[title]:
-                lines.append(f"{a}–{b}")
-            lines.append("")
-    return "\n".join(lines).strip()
+    lines = [status] + [f"❌ {a}–{b}" for a, b in intervals]
+    return "\n".join(lines)
 
 
 def format_outages_by_dayparts_plain(intervals: List[Tuple[str, str]]) -> str:
     if not intervals:
         return "🎉 Відключень не бачу"
 
-    parts = {"🌙 Ніч": [], "☀️ День": [], "🌆 Вечір": []}
-    for a, b in intervals:
-        start = _to_minutes(a)
-        if start < 6 * 60:
-            parts["🌙 Ніч"].append((a, b))
-        elif start < 16 * 60:
-            parts["☀️ День"].append((a, b))
-        else:
-            parts["🌆 Вечір"].append((a, b))
-
-    lines = ["🔌 Без світла:\n"]
-    for title in ["🌙 Ніч", "☀️ День", "🌆 Вечір"]:
-        if parts[title]:
-            lines.append(title)
-            for a, b in parts[title]:
-                lines.append(f"{a}–{b}")
-            lines.append("")
-    return "\n".join(lines).strip()
+    return "\n".join(f"❌ {a}–{b}" for a, b in intervals)
 
 
 def tomorrow_label(now_dt: Optional[datetime] = None) -> str:

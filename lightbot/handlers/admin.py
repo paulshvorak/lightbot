@@ -7,7 +7,7 @@ from telegram.error import Forbidden
 from telegram.ext import ContextTypes
 
 from ..config import ADMIN_IDS, TZ, log
-from ..db import _ensure_users_columns, db_connect, db_delete_user, db_get_last_user, db_users_stats_by_day, touch_from_update
+from ..db import db_connect, db_delete_user, db_get_last_user, db_users_stats_by_day, touch_from_update
 from ..keyboards import main_menu_kb
 
 # ================= TELEGRAM HANDLERS (admin) =================
@@ -86,20 +86,18 @@ async def admin_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("У базі ще немає користувачів.")
         return
 
-    chat_id, username, created_at, last_seen_at = last
-
     def fmt_ts(ts: Optional[int]) -> str:
         if not ts:
             return "—"
         return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-    uname = f"@{username}" if username else "—"
+    uname = f"@{last.username}" if last.username else "—"
     await update.message.reply_text(
         "Останній новий користувач:\n"
-        f"chat_id: {chat_id}\n"
+        f"chat_id: {last.chat_id}\n"
         f"username: {uname}\n"
-        f"created_at: {fmt_ts(created_at)}\n"
-        f"last_seen_at: {fmt_ts(last_seen_at)}"
+        f"created_at: {fmt_ts(last.created_at)}\n"
+        f"last_seen_at: {fmt_ts(last.last_seen_at)}"
     )
 
 
@@ -168,7 +166,6 @@ async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     with db_connect() as con:
-        _ensure_users_columns(con)
         rows = con.execute("""
             SELECT
                 chat_id,
@@ -225,11 +222,9 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     with db_connect() as con:
-        _ensure_users_columns(con)
         rows = con.execute("""
-            SELECT chat_id
-            FROM users
-            WHERE COALESCE(is_configured, 0) = 1
+            SELECT DISTINCT chat_id
+            FROM subscriptions
         """).fetchall()
 
     if not rows:

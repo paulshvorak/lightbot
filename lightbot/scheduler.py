@@ -1,3 +1,4 @@
+import html
 from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -7,8 +8,7 @@ from telegram.ext import Application
 from .config import API_TODAY, API_TOMORROW, TZ, is_quiet_hours, log
 from .db import (
     db_delete_user,
-    db_get_users_basic,
-    db_get_users_for_push,
+    db_get_all_subscriptions,
     db_set_today_memory,
     db_set_tomorrow_memory,
 )
@@ -16,12 +16,12 @@ from .formatting import (
     day_str,
     diff_future_intervals,
     filter_past_intervals,
-    fmt_interval_lines,
     format_outages_by_dayparts_plain,
     format_outages_by_dayparts_today,
     future_changed_only,
     intervals_to_text,
     is_light_now,
+    subscription_short_name,
     tomorrow_day_str,
     tomorrow_label,
     total_off_minutes,
@@ -49,89 +49,92 @@ async def broadcast_tomorrow_poll(app: Application):
     if not intervals_by_row:
         intervals_by_row = [intervals_from_states(r) for r in states]
 
-    users = db_get_users_basic()
-    if not users:
+    subs = db_get_all_subscriptions()
+    if not subs:
         return
 
-    sent_first = 0
-    sent_update = 0
-    removed = 0
+    # групуємо по chat_id, щоб надіслати один пуш на чат, а не по одному на чергу
+    pending_first: dict[int, list[tuple[str, tuple]]] = {}
+    pending_update: dict[int, list[tuple[str, tuple]]] = {}
 
-    for chat_id, queue, subqueue, old_fp, old_states_txt, old_day in users:
+    for sub in subs:
+        chat_id, queue, subqueue = sub.chat_id, sub.queue, sub.subqueue
         row = _row_index(queue, subqueue)
 
         row_states = states[row]
         full_intervals = intervals_by_row[row]
         new_fp = make_fingerprint(queue, subqueue, row_states)
 
+        save_args = (
+            chat_id, queue, subqueue, tday, new_fp,
+            total_off_minutes(full_intervals),
+            intervals_to_text(full_intervals),
+            states_to_text(row_states),
+        )
+
         # 1) якщо для користувача це новий tday — перша публікація
-        if old_day != tday:
+        if sub.tomorrow_day != tday:
             # якщо відключень немає — мовчимо, але зберігаємо стан
             if not full_intervals:
                 db_set_tomorrow_memory(
-                    chat_id, tday, new_fp,
+                    chat_id, queue, subqueue, tday, new_fp,
                     0,
                     "",
                     states_to_text(row_states),
                 )
                 continue
 
-            msg = f"📅 Завтра ({label})\n\n" + format_outages_by_dayparts_plain(full_intervals)
-            try:
-                await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb())
-                sent_first += 1
-            except Forbidden:
-                db_delete_user(chat_id)
-                removed += 1
-                continue
-            except Exception:
-                log.exception("Failed sending tomorrow first to chat_id=%s", chat_id)
-                continue
-
-            db_set_tomorrow_memory(
-                chat_id, tday, new_fp,
-                total_off_minutes(full_intervals),
-                intervals_to_text(full_intervals),
-                states_to_text(row_states),
-            )
+            name = html.escape(subscription_short_name(queue, subqueue, sub.label))
+            block = f"📍 <b>{name}</b>\n" + format_outages_by_dayparts_plain(full_intervals)
+            pending_first.setdefault(chat_id, []).append((block, save_args))
             continue
 
         # 2) якщо нема з чим порівнювати — просто ініціалізуємо без пуша
-        if not old_fp:
-            db_set_tomorrow_memory(
-                chat_id, tday, new_fp,
-                total_off_minutes(full_intervals),
-                intervals_to_text(full_intervals),
-                states_to_text(row_states),
-            )
+        if not sub.tomorrow_fingerprint:
+            db_set_tomorrow_memory(*save_args)
             continue
 
         # 3) якщо fp не змінився — мовчимо
-        if old_fp == new_fp:
+        if sub.tomorrow_fingerprint == new_fp:
             continue
 
-        # 4) fp змінився — пушимо оновлення
-        msg = "🔄 Графіки на завтра оновились\n\n" + f"📅 Завтра ({label})\n\n" + format_outages_by_dayparts_plain(full_intervals)
+        # 4) fp змінився — в чергу на пуш-оновлення
+        name = html.escape(subscription_short_name(queue, subqueue, sub.label))
+        block = f"📍 <b>{name}</b>\n" + format_outages_by_dayparts_plain(full_intervals)
+        pending_update.setdefault(chat_id, []).append((block, save_args))
+
+    sent_first = 0
+    sent_update = 0
+    removed = 0
+
+    for chat_id, items in pending_first.items():
+        msg = f"📅 Завтра ({label})\n\n" + "\n\n".join(block for block, _ in items)
         try:
-            await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb())
-            sent_update += 1
+            await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb(), parse_mode="HTML")
+            sent_first += 1
+            for _, save_args in items:
+                db_set_tomorrow_memory(*save_args)
         except Forbidden:
             db_delete_user(chat_id)
             removed += 1
-            continue
+        except Exception:
+            log.exception("Failed sending tomorrow first to chat_id=%s", chat_id)
+
+    for chat_id, items in pending_update.items():
+        msg = "🔄 Графіки на завтра оновились\n\n" + f"📅 Завтра ({label})\n\n" + "\n\n".join(block for block, _ in items)
+        try:
+            await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb(), parse_mode="HTML")
+            sent_update += 1
+            for _, save_args in items:
+                db_set_tomorrow_memory(*save_args)
+        except Forbidden:
+            db_delete_user(chat_id)
+            removed += 1
         except Exception:
             log.exception("Failed sending tomorrow update to chat_id=%s", chat_id)
-            continue
 
-        db_set_tomorrow_memory(
-            chat_id, tday, new_fp,
-            total_off_minutes(full_intervals),
-            intervals_to_text(full_intervals),
-            states_to_text(row_states),
-        )
-
-    log.info("Tomorrow poll: first=%d update=%d removed=%d total=%d day=%s",
-              sent_first, sent_update, removed, len(users), tday)
+    log.info("Tomorrow poll: first_chats=%d update_chats=%d removed=%d total_subs=%d day=%s",
+              sent_first, sent_update, removed, len(subs), tday)
 
 
 async def broadcast_today_changes(app: Application):
@@ -144,8 +147,8 @@ async def broadcast_today_changes(app: Application):
     if is_quiet_hours():
         return
 
-    users = db_get_users_for_push()
-    if not users:
+    subs = db_get_all_subscriptions()
+    if not subs:
         return
 
     now_dt = datetime.now(TZ)
@@ -160,94 +163,79 @@ async def broadcast_today_changes(app: Application):
         if not intervals_by_row:
             intervals_by_row = [intervals_from_states(r) for r in states]
 
-        for chat_id, queue, subqueue, last_fp, last_total_off, last_intervals_txt, last_states_txt, last_day in users:
+        # групуємо по chat_id, щоб надіслати один пуш на чат, а не по одному на чергу
+        pending: dict[int, list[tuple[str, tuple]]] = {}
+
+        for sub in subs:
+            chat_id, queue, subqueue = sub.chat_id, sub.queue, sub.subqueue
             row = _row_index(queue, subqueue)
             row_states = states[row]
             fp = make_fingerprint(queue, subqueue, row_states)
             full_intervals = intervals_by_row[row]
 
+            save_args = (
+                chat_id, queue, subqueue, today, fp,
+                total_off_minutes(full_intervals),
+                intervals_to_text(full_intervals),
+                states_to_text(row_states),
+            )
+
             # ✅ якщо настав новий день — просто приймаємо поточний графік як базу і НЕ пушимо
-            if last_day != today:
-                db_set_today_memory(
-                    chat_id,
-                    today,
-                    fp,
-                    total_off_minutes(full_intervals),
-                    intervals_to_text(full_intervals),
-                    states_to_text(row_states),
-                )
+            if sub.today_day != today:
+                db_set_today_memory(*save_args)
                 continue
 
             # якщо ще нема з чим порівнювати в межах дня — ініціалізуємо і НЕ пушимо
-            if (last_fp is None) or (last_total_off is None) or (last_intervals_txt is None) or (last_states_txt is None):
-                db_set_today_memory(
-                    chat_id,
-                    today,
-                    fp,
-                    total_off_minutes(full_intervals),
-                    intervals_to_text(full_intervals),
-                    states_to_text(row_states),
-                )
+            if (sub.today_fingerprint is None) or (sub.today_total_off is None) or (sub.today_intervals is None) or (sub.today_states is None):
+                db_set_today_memory(*save_args)
                 continue
 
-            if fp == last_fp:
+            if fp == sub.today_fingerprint:
                 continue  # жодних змін
 
             # якщо зміни тільки в минулих слотах — НЕ пушимо, але оновлюємо базу, щоб не зациклювало
-            if not future_changed_only(row_states, last_states_txt, now_dt):
-                db_set_today_memory(
-                    chat_id,
-                    today,
-                    fp,
-                    total_off_minutes(full_intervals),
-                    intervals_to_text(full_intervals),
-                    states_to_text(row_states),
-                )
+            if not future_changed_only(row_states, sub.today_states, now_dt):
+                db_set_today_memory(*save_args)
                 continue
 
-            cancelled, added = diff_future_intervals(last_states_txt, row_states, now_dt)
+            cancelled, added = diff_future_intervals(sub.today_states, row_states, now_dt)
 
-            lines = ["🔄 Графік оновлено для твоєї черги", ""]
+            name = html.escape(subscription_short_name(queue, subqueue, sub.label))
+            lines = [f"📍 <b>{name}</b>"]
 
             if cancelled:
-                lines.append("❎ Скасували відключення:")
-                lines.append(fmt_interval_lines(cancelled, "❌"))
-                lines.append("")
+                lines.append("❎ Скасовано: " + ", ".join(f"{a}–{b}" for a, b in cancelled))
 
             if added:
-                lines.append("➕ Додали відключення:")
-                lines.append(fmt_interval_lines(added, "➕"))
-                lines.append("")
+                lines.append("➕ Додано: " + ", ".join(f"{a}–{b}" for a, b in added))
 
             # на випадок, якщо fp змінився, але в майбутньому перетворення “в нуль” (дуже рідко)
             if (not cancelled) and (not added):
                 lines.append("➖ Змін у майбутніх годинах не бачу")
-                lines.append("")
-
-            prefix = "\n".join(lines).strip()
 
             view_intervals = filter_past_intervals(full_intervals, now_dt)
             now_has_light = is_light_now(full_intervals, now_dt)
+            lines.append(format_outages_by_dayparts_today(view_intervals, now_has_light, now_dt, full_intervals))
 
-            body = format_outages_by_dayparts_today(view_intervals, now_has_light, now_dt, full_intervals)
-            msg = prefix + "\n\n" + body
+            pending.setdefault(chat_id, []).append(("\n".join(lines), save_args))
 
+        sent = 0
+        removed = 0
+
+        for chat_id, items in pending.items():
+            msg = "🔄 Графік оновлено\n\n" + "\n\n".join(block for block, _ in items)
             try:
-                await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb())
-
-                db_set_today_memory(
-                    chat_id,
-                    today,
-                    fp,
-                    total_off_minutes(full_intervals),
-                    intervals_to_text(full_intervals),
-                    states_to_text(row_states),
-                )
-
+                await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb(), parse_mode="HTML")
+                sent += 1
+                for _, save_args in items:
+                    db_set_today_memory(*save_args)
             except Forbidden:
                 db_delete_user(chat_id)
+                removed += 1
             except Exception:
                 log.exception("Failed sending today change to chat_id=%s", chat_id)
+
+        log.info("Today push: chats=%d removed=%d subs=%d", sent, removed, len(subs))
 
     except Exception:
         log.exception("broadcast(today) failed")
@@ -262,8 +250,8 @@ async def seed_today_baseline(app: Application):
     now_dt = datetime.now(TZ)
     today = day_str(now_dt)
 
-    users = db_get_users_for_push()  # тут є chat_id, queue, subqueue ...
-    if not users:
+    subs = db_get_all_subscriptions()
+    if not subs:
         return
 
     try:
@@ -277,14 +265,15 @@ async def seed_today_baseline(app: Application):
             intervals_by_row = [intervals_from_states(r) for r in states]
 
         updated = 0
-        for chat_id, queue, subqueue, last_fp, last_total_off, last_intervals_txt, last_states_txt, last_day in users:
+        for sub in subs:
+            chat_id, queue, subqueue = sub.chat_id, sub.queue, sub.subqueue
             row = _row_index(queue, subqueue)
             row_states = states[row]
             fp = make_fingerprint(queue, subqueue, row_states)
             full_intervals = intervals_by_row[row]
 
             db_set_today_memory(
-                chat_id,
+                chat_id, queue, subqueue,
                 today,
                 fp,
                 total_off_minutes(full_intervals),

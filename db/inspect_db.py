@@ -2,7 +2,7 @@ import sqlite3
 
 con = sqlite3.connect("users.db")
 rows = con.execute("""
-    SELECT chat_id, username, queue, subqueue, last_fingerprint
+    SELECT chat_id, username, queue, subqueue
     FROM users
 """).fetchall()
 

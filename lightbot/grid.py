@@ -102,14 +102,6 @@ def make_fingerprint(q: int, sq: int, row_states: List[bool]) -> str:
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
 
-def hash_intervals_by_row(intervals_by_row: List[List[Tuple[str, str]]]) -> str:
-    payload = "|".join(
-        ",".join(f"{a}-{b}" for a, b in row)
-        for row in intervals_by_row
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
 # ================= CACHES (per endpoint) =================
 
 _parsed_cache: Dict[str, Dict[str, Any]] = {

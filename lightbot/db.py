@@ -1,8 +1,7 @@
-import os
-import shutil
 import sqlite3
 import time
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional
 
 from telegram import Update
 
@@ -11,13 +10,41 @@ from .config import DB_PATH, log
 # ================= DATABASE =================
 
 
+@dataclass
+class UserRecord:
+    chat_id: int
+    username: Optional[str]
+    created_at: Optional[int]
+    last_seen_at: Optional[int]
+
+
+@dataclass
+class Subscription:
+    chat_id: int
+    queue: int
+    subqueue: int
+    label: Optional[str]
+    today_day: Optional[str]
+    today_fingerprint: Optional[str]
+    today_total_off: Optional[int]
+    today_intervals: Optional[str]
+    today_states: Optional[str]
+    tomorrow_day: Optional[str]
+    tomorrow_fingerprint: Optional[str]
+    tomorrow_total_off: Optional[int]
+    tomorrow_intervals: Optional[str]
+    tomorrow_states: Optional[str]
+
+
 def db_connect() -> sqlite3.Connection:
     """
     Єдине місце для підключення до SQLite з корисними PRAGMA:
     - WAL: краще для паралельних читань/записів (scheduler + handlers)
     - busy_timeout: менше шансів на "database is locked"
+    - row_factory=Row: доступ до колонок за іменем, без tuple-позицій
     """
     con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
     try:
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA busy_timeout=3000")
@@ -27,62 +54,26 @@ def db_connect() -> sqlite3.Connection:
     return con
 
 
-def _ensure_users_columns(con: sqlite3.Connection):
-    """
-    Soft-migration: додаємо колонки, якщо їх нема.
-    """
-    ddls = [
-        # було раніше
-        "ALTER TABLE users ADD COLUMN last_fingerprint TEXT",
-        "ALTER TABLE users ADD COLUMN username TEXT",
-        "ALTER TABLE users ADD COLUMN created_at INTEGER",
-        "ALTER TABLE users ADD COLUMN last_seen_at INTEGER",
-        "ALTER TABLE users ADD COLUMN last_total_off INTEGER",
-        "ALTER TABLE users ADD COLUMN last_intervals TEXT",
-        "ALTER TABLE users ADD COLUMN last_states TEXT",
-
-        # ✅ NEW: розділена памʼять TODAY (в межах одного календарного дня)
-        "ALTER TABLE users ADD COLUMN today_day TEXT",             # YYYY-MM-DD
-        "ALTER TABLE users ADD COLUMN today_fingerprint TEXT",
-        "ALTER TABLE users ADD COLUMN today_total_off INTEGER",
-        "ALTER TABLE users ADD COLUMN today_intervals TEXT",
-        "ALTER TABLE users ADD COLUMN today_states TEXT",
-
-        # ✅ NEW: памʼять TOMORROW
-        "ALTER TABLE users ADD COLUMN tomorrow_day TEXT",          # YYYY-MM-DD (день, на який графік)
-        "ALTER TABLE users ADD COLUMN tomorrow_fingerprint TEXT",
-        "ALTER TABLE users ADD COLUMN tomorrow_total_off INTEGER",
-        "ALTER TABLE users ADD COLUMN tomorrow_intervals TEXT",
-        "ALTER TABLE users ADD COLUMN tomorrow_states TEXT",
-
-        # ✅ NEW: флаг, що юзер вже обрав чергу
-        "ALTER TABLE users ADD COLUMN is_configured INTEGER DEFAULT 0",
-    ]
-    for ddl in ddls:
-        try:
-            con.execute(ddl)
-        except sqlite3.OperationalError:
-            pass
-
-
 def db_init():
     """
-    Створює таблиці, і робить "soft-migration" для старих users.db.
+    Створює таблиці.
     """
     with db_connect() as con:
         con.execute("""
             CREATE TABLE IF NOT EXISTS users(
                 chat_id INTEGER PRIMARY KEY,
-                queue INTEGER NOT NULL,
-                subqueue INTEGER NOT NULL,
-
-                last_fingerprint TEXT,
                 username TEXT,
                 created_at INTEGER,
-                last_seen_at INTEGER,
-                last_total_off INTEGER,
-                last_intervals TEXT,
-                last_states TEXT,
+                last_seen_at INTEGER
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions(
+                chat_id INTEGER NOT NULL,
+                queue INTEGER NOT NULL,
+                subqueue INTEGER NOT NULL,
+                label TEXT,
 
                 today_day TEXT,
                 today_fingerprint TEXT,
@@ -96,34 +87,30 @@ def db_init():
                 tomorrow_intervals TEXT,
                 tomorrow_states TEXT,
 
-                is_configured INTEGER DEFAULT 0
+                PRIMARY KEY (chat_id, queue, subqueue)
             )
         """)
 
-        _ensure_users_columns(con)
-
-        # ✅ МІГРАЦІЯ is_configured ДЛЯ СТАРОЇ БАЗИ:
-        # ставимо configured=1 ТІЛЬКИ тим, у кого вже є збережений стан/памʼять
-        # (тобто це точно "старі реальні" юзери, а не нові, яких лише touchнули)
-        con.execute("""
-                    UPDATE users
-                    SET is_configured = 1
-                    WHERE COALESCE(is_configured, 0) = 0
-                      AND (
-                            today_fingerprint IS NOT NULL
-                         OR today_states IS NOT NULL
-                         OR last_fingerprint IS NOT NULL
-                         OR last_states IS NOT NULL
-                      )
-                """)
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS meta(
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
         con.commit()
+
+
+def _row_to_subscription(row: sqlite3.Row) -> Subscription:
+    return Subscription(
+        chat_id=row["chat_id"],
+        queue=row["queue"],
+        subqueue=row["subqueue"],
+        label=row["label"],
+        today_day=row["today_day"],
+        today_fingerprint=row["today_fingerprint"],
+        today_total_off=row["today_total_off"],
+        today_intervals=row["today_intervals"],
+        today_states=row["today_states"],
+        tomorrow_day=row["tomorrow_day"],
+        tomorrow_fingerprint=row["tomorrow_fingerprint"],
+        tomorrow_total_off=row["tomorrow_total_off"],
+        tomorrow_intervals=row["tomorrow_intervals"],
+        tomorrow_states=row["tomorrow_states"],
+    )
 
 
 def db_touch_user(chat_id: int, username: Optional[str]):
@@ -134,20 +121,9 @@ def db_touch_user(chat_id: int, username: Optional[str]):
     """
     now_ts = int(time.time())
     with db_connect() as con:
-        _ensure_users_columns(con)
         con.execute("""
-            INSERT INTO users(
-                chat_id, queue, subqueue,
-                last_fingerprint, username, created_at, last_seen_at,
-                last_total_off, last_intervals, last_states,
-                today_day, today_fingerprint, today_total_off, today_intervals, today_states,
-                tomorrow_day, tomorrow_fingerprint, tomorrow_total_off, tomorrow_intervals, tomorrow_states
-            )
-            VALUES(?, 1, 1,
-                   NULL, ?, ?, ?,
-                   NULL, NULL, NULL,
-                   NULL, NULL, NULL, NULL, NULL,
-                   NULL, NULL, NULL, NULL, NULL)
+            INSERT INTO users(chat_id, username, created_at, last_seen_at)
+            VALUES(?, ?, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 username = COALESCE(excluded.username, users.username),
                 last_seen_at=excluded.last_seen_at,
@@ -156,135 +132,95 @@ def db_touch_user(chat_id: int, username: Optional[str]):
         con.commit()
 
 
-def db_upsert_user(chat_id: int, queue: int, subqueue: int):
-    """
-    Оновлює чергу/підчергу + позначає юзера як сконфігурованого.
-    """
+def db_has_subscriptions(chat_id: int) -> bool:
     with db_connect() as con:
-        _ensure_users_columns(con)
+        cur = con.execute(
+            "SELECT 1 FROM subscriptions WHERE chat_id=? LIMIT 1",
+            (chat_id,)
+        )
+        return cur.fetchone() is not None
+
+
+def db_add_subscription(chat_id: int, queue: int, subqueue: int):
+    with db_connect() as con:
         con.execute("""
-            INSERT INTO users(
-                chat_id, queue, subqueue, is_configured,
-                last_fingerprint, last_total_off, last_intervals, last_states,
-                today_day, today_fingerprint, today_total_off, today_intervals, today_states,
-                tomorrow_day, tomorrow_fingerprint, tomorrow_total_off, tomorrow_intervals, tomorrow_states
-            )
-            VALUES(?, ?, ?, 1,
-                   NULL, NULL, NULL, NULL,
-                   NULL, NULL, NULL, NULL, NULL,
-                   NULL, NULL, NULL, NULL, NULL)
-            ON CONFLICT(chat_id) DO UPDATE
-            SET queue=excluded.queue,
-                subqueue=excluded.subqueue,
-                is_configured=1
+            INSERT OR IGNORE INTO subscriptions(chat_id, queue, subqueue)
+            VALUES(?, ?, ?)
         """, (chat_id, queue, subqueue))
         con.commit()
 
 
-def db_is_configured(chat_id: int) -> bool:
+def db_set_subscription_label(chat_id: int, queue: int, subqueue: int, label: Optional[str]):
     with db_connect() as con:
-        _ensure_users_columns(con)
-        cur = con.execute(
-            "SELECT COALESCE(is_configured, 0) FROM users WHERE chat_id=?",
-            (chat_id,)
+        con.execute(
+            "UPDATE subscriptions SET label=? WHERE chat_id=? AND queue=? AND subqueue=?",
+            (label, chat_id, queue, subqueue)
         )
-        row = cur.fetchone()
-        return bool(row and row[0] == 1)
+        con.commit()
 
 
-def db_get_users_for_push() -> List[Tuple[int, int, int, Optional[str], Optional[int], Optional[str], Optional[str], Optional[str]]]:
+def db_remove_subscription(chat_id: int, queue: int, subqueue: int):
     with db_connect() as con:
-        _ensure_users_columns(con)
-        cur = con.execute("""
-            SELECT chat_id, queue, subqueue,
-                   today_fingerprint, today_total_off, today_intervals, today_states, today_day
-            FROM users
-            WHERE COALESCE(is_configured, 0) = 1
-        """)
-        return list(cur.fetchall())
+        con.execute(
+            "DELETE FROM subscriptions WHERE chat_id=? AND queue=? AND subqueue=?",
+            (chat_id, queue, subqueue)
+        )
+        con.commit()
 
 
-def db_get_users_basic() -> List[Tuple[int, int, int, Optional[str], Optional[str], Optional[str]]]:
+def db_get_subscriptions(chat_id: int) -> List[Subscription]:
     with db_connect() as con:
-        _ensure_users_columns(con)
         cur = con.execute("""
-            SELECT chat_id, queue, subqueue,
-                   tomorrow_fingerprint, tomorrow_states, tomorrow_day
-            FROM users
-            WHERE COALESCE(is_configured, 0) = 1
-        """)
-        return list(cur.fetchall())
-
-
-def db_get_user_queue(chat_id: int) -> Optional[Tuple[int, int]]:
-    with db_connect() as con:
-        _ensure_users_columns(con)
-        cur = con.execute("""
-            SELECT queue, subqueue
-            FROM users
-            WHERE chat_id=? AND COALESCE(is_configured, 0) = 1
+            SELECT * FROM subscriptions
+            WHERE chat_id=?
+            ORDER BY queue, subqueue
         """, (chat_id,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return int(row[0]), int(row[1])
+        return [_row_to_subscription(r) for r in cur.fetchall()]
 
 
-def db_set_today_memory(chat_id: int, day: str, fp: str, total_off: int, intervals_text: str, states_text: str):
+def db_get_all_subscriptions() -> List[Subscription]:
     with db_connect() as con:
-        _ensure_users_columns(con)
+        cur = con.execute("SELECT * FROM subscriptions")
+        return [_row_to_subscription(r) for r in cur.fetchall()]
+
+
+def db_set_today_memory(chat_id: int, queue: int, subqueue: int, day: str, fp: str, total_off: int, intervals_text: str, states_text: str):
+    with db_connect() as con:
         con.execute("""
-            UPDATE users
+            UPDATE subscriptions
             SET today_day=?,
                 today_fingerprint=?,
                 today_total_off=?,
                 today_intervals=?,
                 today_states=?
-            WHERE chat_id=?
-        """, (day, fp, total_off, intervals_text, states_text, chat_id))
+            WHERE chat_id=? AND queue=? AND subqueue=?
+        """, (day, fp, total_off, intervals_text, states_text, chat_id, queue, subqueue))
         con.commit()
 
 
-def db_set_tomorrow_memory(chat_id: int, day: str, fp: str, total_off: int, intervals_text: str, states_text: Optional[str]):
+def db_set_tomorrow_memory(chat_id: int, queue: int, subqueue: int, day: str, fp: str, total_off: int, intervals_text: str, states_text: Optional[str]):
     with db_connect() as con:
-        _ensure_users_columns(con)
         con.execute("""
-            UPDATE users
+            UPDATE subscriptions
             SET tomorrow_day=?,
                 tomorrow_fingerprint=?,
                 tomorrow_total_off=?,
                 tomorrow_intervals=?,
                 tomorrow_states=?
-            WHERE chat_id=?
-        """, (day, fp, total_off, intervals_text, states_text, chat_id))
+            WHERE chat_id=? AND queue=? AND subqueue=?
+        """, (day, fp, total_off, intervals_text, states_text, chat_id, queue, subqueue))
         con.commit()
 
 
 def db_delete_user(chat_id: int):
     with db_connect() as con:
+        con.execute("DELETE FROM subscriptions WHERE chat_id=?", (chat_id,))
         con.execute("DELETE FROM users WHERE chat_id=?", (chat_id,))
         con.commit()
 
 
-def db_meta_get(key: str) -> Optional[str]:
+def db_get_last_user() -> Optional[UserRecord]:
     with db_connect() as con:
-        cur = con.execute("SELECT value FROM meta WHERE key=?", (key,))
-        row = cur.fetchone()
-        return row[0] if row else None
-
-
-def db_meta_set(key: str, value: str):
-    with db_connect() as con:
-        con.execute("""
-            INSERT INTO meta(key, value) VALUES(?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """, (key, value))
-        con.commit()
-
-
-def db_get_last_user() -> Optional[Tuple[int, Optional[str], Optional[int], Optional[int]]]:
-    with db_connect() as con:
-        _ensure_users_columns(con)
         cur = con.execute("""
             SELECT chat_id, username, created_at, last_seen_at
             FROM users
@@ -293,7 +229,14 @@ def db_get_last_user() -> Optional[Tuple[int, Optional[str], Optional[int], Opti
             LIMIT 1
         """)
         row = cur.fetchone()
-        return row if row else None
+        if not row:
+            return None
+        return UserRecord(
+            chat_id=row["chat_id"],
+            username=row["username"],
+            created_at=row["created_at"],
+            last_seen_at=row["last_seen_at"],
+        )
 
 
 def touch_from_update(update: Update) -> None:
@@ -328,16 +271,4 @@ def db_users_stats_by_day(days: int = 14) -> tuple[int, list[tuple[str, int]]]:
             ORDER BY day DESC
         """, (f"-{days} days",)).fetchall()
 
-    return int(total), [(day, int(cnt)) for day, cnt in rows]
-
-
-# ================= TRANSFER DB =================
-
-def ensure_seed_db():
-    if os.path.exists(DB_PATH):
-        return
-
-    seed = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "users.db")
-    if os.path.exists(seed):
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        shutil.copy2(seed, DB_PATH)
+    return int(total), [(row["day"], int(row["cnt"])) for row in rows]

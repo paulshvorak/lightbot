@@ -1,9 +1,9 @@
 import os
 
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from .config import DB_PATH, log
-from .db import db_init, ensure_seed_db
+from .db import db_init
 from .errors import on_error
 from .handlers import admin, user
 from .scheduler import post_init
@@ -17,7 +17,6 @@ def main():
     if DB_PATH and os.path.dirname(DB_PATH):
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-    ensure_seed_db()
     db_init()
 
     app = Application.builder().token(token).post_init(post_init).build()
@@ -33,10 +32,12 @@ def main():
 
     app.add_handler(CallbackQueryHandler(user.on_menu_set, pattern=r"^menu:set$"))
     app.add_handler(CallbackQueryHandler(user.on_menu_now, pattern=r"^menu:now$"))
-    app.add_handler(CallbackQueryHandler(user.on_menu_tomorrow, pattern=r"^menu:tomorrow$"))
     app.add_handler(CallbackQueryHandler(user.on_menu_back, pattern=r"^menu:back$"))
-    app.add_handler(CallbackQueryHandler(user.on_set_queue_button, pattern=r"^set:q:\d+$"))
-    app.add_handler(CallbackQueryHandler(user.on_set_subqueue_button, pattern=r"^set:sq:[12]$"))
+    app.add_handler(CallbackQueryHandler(user.on_add_queue, pattern=r"^set:qs:[1-6]:[12]$"))
+    app.add_handler(CallbackQueryHandler(user.on_sub_add, pattern=r"^sub:add$"))
+    app.add_handler(CallbackQueryHandler(user.on_sub_delete, pattern=r"^sub:del:[1-6]:[12]$"))
+    app.add_handler(CallbackQueryHandler(user.on_sub_rename, pattern=r"^sub:rename:[1-6]:[12]$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, user.on_label_text))
 
     app.add_error_handler(on_error)
 
