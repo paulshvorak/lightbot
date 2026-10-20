@@ -37,7 +37,12 @@ def main():
     app.add_handler(CallbackQueryHandler(user.on_sub_add, pattern=r"^sub:add$"))
     app.add_handler(CallbackQueryHandler(user.on_sub_delete, pattern=r"^sub:del:[1-6]:[12]$"))
     app.add_handler(CallbackQueryHandler(user.on_sub_rename, pattern=r"^sub:rename:[1-6]:[12]$"))
+    app.add_handler(CallbackQueryHandler(user.on_restart, pattern=r"^menu:restart$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, user.on_label_text))
+
+    # ТИМЧАСОВО: ловить будь-яку необроблену кнопку (застарілі клавіатури
+    # з-перед рефакторингу на мульти-черги) — має бути останнім CallbackQueryHandler-ом.
+    app.add_handler(CallbackQueryHandler(user.on_unknown_callback))
 
     app.add_error_handler(on_error)
 

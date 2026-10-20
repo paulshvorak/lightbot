@@ -90,6 +90,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+async def on_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Те саме, що /start, але як callback-кнопка — для юзерів зі застарілою
+    клавіатурою в чаті (ще з-перед рефакторингу на мульти-черги).
+    """
+    touch_from_update(update)
+    q = update.callback_query
+    await _safe_answer(q)
+
+    chat_id = q.message.chat_id
+    if db_has_subscriptions(chat_id):
+        await _safe_edit_text(q, "Меню", reply_markup=main_menu_kb())
+    else:
+        await _safe_edit_text(q, "Привіт! Спочатку обери свою чергу 👇", reply_markup=first_menu_kb())
+
+
+async def on_unknown_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Фолбек для будь-якої кнопки, яку жоден конкретний хендлер не впізнав —
+    типово стара клавіатура з чату, що лишилась з-перед рефакторингу.
+    ТИМЧАСОВО, поки такі старі повідомлення не "вимруть" природним шляхом.
+    """
+    touch_from_update(update)
+    q = update.callback_query
+    if not q or not q.message:
+        return
+    await _safe_answer(q, "⚠️ Ця кнопка застаріла")
+    await context.bot.send_message(
+        chat_id=q.message.chat_id,
+        text="⚠️ Ця кнопка застаріла. Натисни, щоб оновити меню:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Рестарт", callback_data="menu:restart")]]),
+    )
+
+
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_from_update(update)
     await update.message.reply_text(
