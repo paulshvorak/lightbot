@@ -1,7 +1,5 @@
 import logging
 import os
-from datetime import datetime
-from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
@@ -36,12 +34,6 @@ MAX_SUBSCRIPTIONS = 3
 # Поріг визначення "темна клітинка" (нема світла) по V каналу HSV (підібраний)
 V_THRESHOLD = 185
 
-# ================= QUIET HOURS =================
-# Тихі години для ПУШ-розсилок (scheduler jobs). Ручні кнопки/запити працюють як і раніше.
-# Інтервал: [start, end), тобто END не включно.
-QUIET_HOURS_START = 0   # 00:00
-QUIET_HOURS_END = 6     # 06:00
-
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("light_bot")
 
@@ -69,9 +61,3 @@ SESSION.headers.update({
     "Accept": "application/json,image/*,*/*",
     "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
 })
-
-
-def is_quiet_hours(now_dt: Optional[datetime] = None) -> bool:
-    if now_dt is None:
-        now_dt = datetime.now(TZ)
-    return QUIET_HOURS_START <= now_dt.hour < QUIET_HOURS_END

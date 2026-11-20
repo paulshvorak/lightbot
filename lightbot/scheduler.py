@@ -6,7 +6,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram.error import Forbidden
 from telegram.ext import Application
 
-from .config import API_TODAY, API_TOMORROW, TZ, is_quiet_hours, log
+from .config import API_TODAY, API_TOMORROW, TZ, log
 from .db import (
     db_delete_user,
     db_get_all_subscriptions,
@@ -34,9 +34,6 @@ from .keyboards import main_menu_kb
 
 
 async def broadcast_tomorrow_poll(app: Application):
-    if is_quiet_hours():
-        return
-
     now_dt = datetime.now(TZ)
     tday = tomorrow_day_str(now_dt)
     label = tomorrow_label(now_dt)
@@ -143,11 +140,9 @@ async def broadcast_today_changes(app: Application):
     Вимога:
     - впродовж дня сигналізуємо зміни в черзі користувача
     - порівнюємо завжди з останнім СЬОГОДНІ
-    - НЕ порівнюємо з вчорашнім today (якщо day змінився — просто ініціалізуємо today-базу і НЕ пушимо)
+    - якщо настав новий день — порівнюємо з тим, що вже обіцяли вчора як "завтра" на цю ж дату:
+      збігається → людина вже в курсі, мовчимо; відрізняється (або вчорашнього пушу не було) → пушимо зараз
     """
-    if is_quiet_hours():
-        return
-
     subs = db_get_all_subscriptions()
     if not subs:
         return
@@ -165,7 +160,8 @@ async def broadcast_today_changes(app: Application):
             intervals_by_row = [intervals_from_states(r) for r in states]
 
         # групуємо по chat_id, щоб надіслати один пуш на чат, а не по одному на чергу
-        pending: dict[int, list[tuple[str, tuple]]] = {}
+        pending_daystart: dict[int, list[tuple[str, tuple]]] = {}
+        pending_update: dict[int, list[tuple[str, tuple]]] = {}
 
         for sub in subs:
             chat_id, queue, subqueue = sub.chat_id, sub.queue, sub.subqueue
@@ -181,9 +177,22 @@ async def broadcast_today_changes(app: Application):
                 states_to_text(row_states),
             )
 
-            # ✅ якщо настав новий день — просто приймаємо поточний графік як базу і НЕ пушимо
+            # настав новий день — звіряємо з тим, що вже обіцяли вчора як "завтра" на цю дату
             if sub.today_day != today:
-                db_set_today_memory(*save_args)
+                already_known = (sub.tomorrow_day == today) and (sub.tomorrow_fingerprint == fp)
+
+                if already_known or not full_intervals:
+                    db_set_today_memory(*save_args)
+                    continue
+
+                name = html.escape(subscription_short_name(queue, subqueue, sub.label))
+                view_intervals = filter_past_intervals(full_intervals, now_dt)
+                now_has_light = is_light_now(full_intervals, now_dt)
+                block = (
+                    f"📍 <b>{name}</b>\n"
+                    + format_outages_by_dayparts_today(view_intervals, now_has_light, now_dt, full_intervals)
+                )
+                pending_daystart.setdefault(chat_id, []).append((block, save_args))
                 continue
 
             # якщо ще нема з чим порівнювати в межах дня — ініціалізуємо і НЕ пушимо
@@ -218,16 +227,30 @@ async def broadcast_today_changes(app: Application):
             now_has_light = is_light_now(full_intervals, now_dt)
             lines.append(format_outages_by_dayparts_today(view_intervals, now_has_light, now_dt, full_intervals))
 
-            pending.setdefault(chat_id, []).append(("\n".join(lines), save_args))
+            pending_update.setdefault(chat_id, []).append(("\n".join(lines), save_args))
 
-        sent = 0
+        sent_daystart = 0
+        sent_update = 0
         removed = 0
 
-        for chat_id, items in pending.items():
+        for chat_id, items in pending_daystart.items():
+            msg = f"📅 Графік на сьогодні ({today})\n\n" + "\n\n".join(block for block, _ in items)
+            try:
+                await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb(), parse_mode="HTML")
+                sent_daystart += 1
+                for _, save_args in items:
+                    db_set_today_memory(*save_args)
+            except Forbidden:
+                db_delete_user(chat_id)
+                removed += 1
+            except Exception:
+                log.exception("Failed sending today daystart to chat_id=%s", chat_id)
+
+        for chat_id, items in pending_update.items():
             msg = "🔄 Графік оновлено\n\n" + "\n\n".join(block for block, _ in items)
             try:
                 await app.bot.send_message(chat_id, msg, reply_markup=main_menu_kb(), parse_mode="HTML")
-                sent += 1
+                sent_update += 1
                 for _, save_args in items:
                     db_set_today_memory(*save_args)
             except Forbidden:
@@ -236,57 +259,13 @@ async def broadcast_today_changes(app: Application):
             except Exception:
                 log.exception("Failed sending today change to chat_id=%s", chat_id)
 
-        log.info("Today push: chats=%d removed=%d subs=%d", sent, removed, len(subs))
+        log.info(
+            "Today push: daystart_chats=%d update_chats=%d removed=%d subs=%d",
+            sent_daystart, sent_update, removed, len(subs),
+        )
 
     except Exception:
         log.exception("broadcast(today) failed")
-
-
-async def seed_today_baseline(app: Application):
-    """
-    О 00:00 робимо "тихий baseline" на сьогодні:
-    - НЕ шлемо пуші
-    - просто записуємо today_* для всіх сконфігурованих юзерів
-    """
-    now_dt = datetime.now(TZ)
-    today = day_str(now_dt)
-
-    subs = db_get_all_subscriptions()
-    if not subs:
-        return
-
-    try:
-        url, states = await asyncio.to_thread(get_states_cached, API_TODAY)
-        if not url or not states:
-            log.warning("seed_today_baseline: no states/url")
-            return
-
-        intervals_by_row = _parsed_cache.get(API_TODAY, {}).get("intervals_by_row")
-        if not intervals_by_row:
-            intervals_by_row = [intervals_from_states(r) for r in states]
-
-        updated = 0
-        for sub in subs:
-            chat_id, queue, subqueue = sub.chat_id, sub.queue, sub.subqueue
-            row = _row_index(queue, subqueue)
-            row_states = states[row]
-            fp = make_fingerprint(queue, subqueue, row_states)
-            full_intervals = intervals_by_row[row]
-
-            db_set_today_memory(
-                chat_id, queue, subqueue,
-                today,
-                fp,
-                total_off_minutes(full_intervals),
-                intervals_to_text(full_intervals),
-                states_to_text(row_states),
-            )
-            updated += 1
-
-        log.info("seed_today_baseline: updated=%d day=%s", updated, today)
-
-    except Exception:
-        log.exception("seed_today_baseline failed")
 
 
 async def post_init(app: Application):
@@ -313,15 +292,5 @@ async def post_init(app: Application):
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
     log.info(
-        "Scheduler started (today: every 5 min, tomorrow: 18-23 every 5 min)"
-    )
-
-    # ✅ тихий baseline для today о 00:30 (щоб після 06:00 був з чим порівнювати)
-    scheduler.add_job(
-        seed_today_baseline,
-        "cron",
-        hour=0,
-        minute=30,
-        args=[app],
-        timezone=TZ,
+        "Scheduler started (today: every 5 min 24/7, tomorrow: 18-23 every 5 min)"
     )
