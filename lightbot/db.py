@@ -77,9 +77,15 @@ def db_init():
                 chat_id INTEGER PRIMARY KEY,
                 username TEXT,
                 created_at INTEGER,
-                last_seen_at INTEGER
+                last_seen_at INTEGER,
+                referred_by INTEGER
             )
         """)
+
+        try:
+            con.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+        except sqlite3.OperationalError:
+            pass
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions(
@@ -271,6 +277,42 @@ def touch_from_update(update: Update) -> None:
             db_touch_user(chat_id, username)
     except Exception:
         log.exception("touch_from_update failed")
+
+
+def db_user_exists(chat_id: int) -> bool:
+    with db_connect() as con:
+        cur = con.execute("SELECT 1 FROM users WHERE chat_id=? LIMIT 1", (chat_id,))
+        return cur.fetchone() is not None
+
+
+def db_set_referral(chat_id: int, referred_by: int) -> None:
+    with db_connect() as con:
+        con.execute(
+            "UPDATE users SET referred_by=? WHERE chat_id=? AND referred_by IS NULL",
+            (referred_by, chat_id),
+        )
+        con.commit()
+
+
+def db_referral_total() -> int:
+    with db_connect() as con:
+        cur = con.execute("SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL")
+        return int(cur.fetchone()[0])
+
+
+def db_referral_top(limit: int = 10) -> list[tuple[int, Optional[str], int]]:
+    """(referrer_chat_id, username_реферера, скільки людей привів), найбільше спочатку."""
+    with db_connect() as con:
+        rows = con.execute("""
+            SELECT u2.referred_by AS chat_id, u1.username AS username, COUNT(*) AS cnt
+            FROM users u2
+            LEFT JOIN users u1 ON u1.chat_id = u2.referred_by
+            WHERE u2.referred_by IS NOT NULL
+            GROUP BY u2.referred_by
+            ORDER BY cnt DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    return [(row["chat_id"], row["username"], int(row["cnt"])) for row in rows]
 
 
 def db_log_click(button_key: str, chat_id: int) -> None:
