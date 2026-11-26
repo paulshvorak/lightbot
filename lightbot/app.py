@@ -32,6 +32,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(user.on_menu_set, pattern=r"^menu:set$"))
     app.add_handler(CallbackQueryHandler(user.on_menu_now, pattern=r"^menu:now$"))
+    app.add_handler(CallbackQueryHandler(user.on_menu_share, pattern=r"^menu:share$"))
     app.add_handler(CallbackQueryHandler(user.on_menu_back, pattern=r"^menu:back$"))
     app.add_handler(CallbackQueryHandler(user.on_add_queue, pattern=r"^set:qs:[1-6]:[12]$"))
     app.add_handler(CallbackQueryHandler(user.on_sub_add, pattern=r"^sub:add$"))

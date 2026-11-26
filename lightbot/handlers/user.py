@@ -362,7 +362,7 @@ async def on_menu_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = q.message.chat_id
-    log.info("Share click chat_id=%s", chat_id)
+    db_log_click("menu:share", chat_id)
     await _safe_answer(q)
 
     share_url = (

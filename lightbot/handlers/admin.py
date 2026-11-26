@@ -111,6 +111,7 @@ async def admin_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
 BUTTON_LABELS = {
     "menu:now": "🔍 Чи є світло зараз?",
     "menu:set": "⚙️ Встановити/змінити чергу",
+    "menu:share": "📤 Поділитись",
 }
 
 
