@@ -32,6 +32,13 @@ def fetch_latest_image_url_from_api(api_url: str) -> Optional[str]:
             return None
         return API_BASE + v if v.startswith("/") else v
 
+    # поточний формат API: голий список [{"value": "...", ...}]
+    if isinstance(data, list) and data:
+        item = data[0]
+        if isinstance(item, dict):
+            return _normalize(item.get("value"))
+        return None
+
     if isinstance(data, dict) and isinstance(data.get("hydra:member"), list) and data["hydra:member"]:
         item = data["hydra:member"][0]
         if isinstance(item, dict):
