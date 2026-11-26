@@ -3,6 +3,7 @@ import html
 import time
 from datetime import datetime
 from typing import Optional
+from urllib.parse import quote
 
 from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden
@@ -13,6 +14,7 @@ from ..db import (
     db_add_subscription,
     db_get_subscriptions,
     db_has_subscriptions,
+    db_log_click,
     db_remove_subscription,
     db_set_subscription_label,
     db_set_today_memory,
@@ -139,6 +141,7 @@ async def on_menu_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_answer(q)
 
     chat_id = q.message.chat_id
+    db_log_click("menu:set", chat_id)
     subs = db_get_subscriptions(chat_id)
     text = f"Твої черги ({len(subs)}/{MAX_SUBSCRIPTIONS}):" if subs else "Ще немає жодної черги 👇"
     await _safe_edit_text(q, text, reply_markup=manage_kb(subs))
@@ -275,6 +278,7 @@ async def on_menu_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = q.message.chat_id
+    db_log_click("menu:now", chat_id)
 
     # cooldown (на чат) — ПОПАП і вихід
     t = time.time()
@@ -345,6 +349,31 @@ async def on_menu_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception("now failed")
         await _safe_answer(q, "⚠️ Сталася помилка. Спробуй ще раз.")
+
+
+BOT_PUBLIC_LINK = "https://t.me/volyn_light_schedule_bot"
+SHARE_TEXT = "⚡ СвітлоБот — показує графік відключень світла для Волиньобленерго і сам пише, коли щось зміниться."
+
+
+async def on_menu_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_from_update(update)
+    q = update.callback_query
+    if not q or not q.message:
+        return
+
+    chat_id = q.message.chat_id
+    log.info("Share click chat_id=%s", chat_id)
+    await _safe_answer(q)
+
+    share_url = (
+        "https://t.me/share/url?url=" + quote(BOT_PUBLIC_LINK, safe="")
+        + "&text=" + quote(SHARE_TEXT, safe="")
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Тисни, щоб обрати, з ким поділитись 👇",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📤 Обрати чат", url=share_url)]]),
+    )
 
 
 async def on_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):

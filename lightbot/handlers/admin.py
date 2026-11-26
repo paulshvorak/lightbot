@@ -7,7 +7,14 @@ from telegram.error import Forbidden
 from telegram.ext import ContextTypes
 
 from ..config import ADMIN_IDS, TZ, log
-from ..db import db_connect, db_delete_user, db_get_last_user, db_users_stats_by_day, touch_from_update
+from ..db import (
+    db_click_summary,
+    db_connect,
+    db_delete_user,
+    db_get_last_user,
+    db_users_stats_by_day,
+    touch_from_update,
+)
 from ..keyboards import main_menu_kb
 
 # ================= TELEGRAM HANDLERS (admin) =================
@@ -101,6 +108,12 @@ async def admin_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+BUTTON_LABELS = {
+    "menu:now": "🔍 Чи є світло зараз?",
+    "menu:set": "⚙️ Встановити/змінити чергу",
+}
+
+
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_from_update(update)
 
@@ -123,6 +136,18 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         for day, cnt in by_days:
             lines.append(f"{day}: {cnt}")
+
+    day_start_ts = int(datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    clicks = db_click_summary(day_start_ts)
+
+    lines.append("")
+    lines.append("🖱 Кліки по кнопках:")
+    if not clicks:
+        lines.append("— немає даних —")
+    else:
+        for button_key, today_cnt, total_cnt in clicks:
+            label = BUTTON_LABELS.get(button_key, button_key)
+            lines.append(f"{label}: сьогодні {today_cnt}, всього {total_cnt}")
 
     text = "\n".join(lines)
 

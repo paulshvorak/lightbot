@@ -104,6 +104,15 @@ def db_init():
             )
         """)
 
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS button_clicks(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                button_key TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                clicked_at INTEGER NOT NULL
+            )
+        """)
+
         con.commit()
 
 
@@ -262,6 +271,33 @@ def touch_from_update(update: Update) -> None:
             db_touch_user(chat_id, username)
     except Exception:
         log.exception("touch_from_update failed")
+
+
+def db_log_click(button_key: str, chat_id: int) -> None:
+    with db_connect() as con:
+        con.execute(
+            "INSERT INTO button_clicks(button_key, chat_id, clicked_at) VALUES(?, ?, ?)",
+            (button_key, chat_id, int(time.time())),
+        )
+        con.commit()
+
+
+def db_click_summary(day_start_ts: int) -> list[tuple[str, int, int]]:
+    """
+    Повертає (button_key, today_count, total_count) для кожної кнопки,
+    що хоч раз логувалась. day_start_ts — unix-час початку "сьогодні"
+    в таймзоні бота (рахується в Python, не покладаємось на localtime SQLite).
+    """
+    with db_connect() as con:
+        rows = con.execute("""
+            SELECT
+                button_key,
+                SUM(CASE WHEN clicked_at >= ? THEN 1 ELSE 0 END) AS today_cnt,
+                COUNT(*) AS total_cnt
+            FROM button_clicks
+            GROUP BY button_key
+        """, (day_start_ts,)).fetchall()
+    return [(row["button_key"], int(row["today_cnt"] or 0), int(row["total_cnt"])) for row in rows]
 
 
 def db_users_stats_by_day(days: int = 14) -> tuple[int, list[tuple[str, int]]]:
