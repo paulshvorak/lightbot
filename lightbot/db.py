@@ -119,6 +119,14 @@ def db_init():
             )
         """)
 
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS campaign_sends(
+                chat_id INTEGER PRIMARY KEY,
+                campaign_key TEXT,
+                sent_at INTEGER
+            )
+        """)
+
         con.commit()
 
 
@@ -294,25 +302,70 @@ def db_set_referral(chat_id: int, referred_by: int) -> None:
         con.commit()
 
 
-def db_referral_total() -> int:
+def db_referral_totals() -> tuple[int, int]:
+    """(всього прийшло через реферал, з них реально обрали чергу)."""
     with db_connect() as con:
-        cur = con.execute("SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL")
-        return int(cur.fetchone()[0])
+        total = con.execute(
+            "SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL"
+        ).fetchone()[0]
+        activated = con.execute("""
+            SELECT COUNT(*) FROM users u
+            WHERE u.referred_by IS NOT NULL
+              AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.chat_id = u.chat_id)
+        """).fetchone()[0]
+    return int(total), int(activated)
 
 
-def db_referral_top(limit: int = 10) -> list[tuple[int, Optional[str], int]]:
-    """(referrer_chat_id, username_реферера, скільки людей привів), найбільше спочатку."""
+def db_referral_top(limit: int = 10) -> list[tuple[int, Optional[str], int, int]]:
+    """(referrer_chat_id, username_реферера, всього привів, з них активних), найактивніші спочатку."""
     with db_connect() as con:
         rows = con.execute("""
-            SELECT u2.referred_by AS chat_id, u1.username AS username, COUNT(*) AS cnt
+            SELECT
+                u2.referred_by AS chat_id,
+                u1.username AS username,
+                COUNT(*) AS total_cnt,
+                SUM(CASE WHEN EXISTS (SELECT 1 FROM subscriptions s WHERE s.chat_id = u2.chat_id) THEN 1 ELSE 0 END) AS activated_cnt
             FROM users u2
             LEFT JOIN users u1 ON u1.chat_id = u2.referred_by
             WHERE u2.referred_by IS NOT NULL
             GROUP BY u2.referred_by
-            ORDER BY cnt DESC
+            ORDER BY activated_cnt DESC, total_cnt DESC
             LIMIT ?
         """, (limit,)).fetchall()
-    return [(row["chat_id"], row["username"], int(row["cnt"])) for row in rows]
+    return [(row["chat_id"], row["username"], int(row["total_cnt"]), int(row["activated_cnt"])) for row in rows]
+
+
+def db_mark_campaign_sent(chat_id: int, campaign_key: str) -> None:
+    with db_connect() as con:
+        con.execute("""
+            INSERT INTO campaign_sends(chat_id, campaign_key, sent_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                campaign_key=excluded.campaign_key,
+                sent_at=excluded.sent_at
+        """, (chat_id, campaign_key, int(time.time())))
+        con.commit()
+
+
+def db_last_campaign_sent(chat_id: int) -> Optional[tuple[str, int]]:
+    with db_connect() as con:
+        row = con.execute(
+            "SELECT campaign_key, sent_at FROM campaign_sends WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return row["campaign_key"], row["sent_at"]
+
+
+def db_chat_ids_sent_since(cutoff_ts: int) -> set:
+    """chat_id'и, яким вже слали будь-яку кампанію не раніше cutoff_ts — виключати з нової розсилки."""
+    with db_connect() as con:
+        rows = con.execute(
+            "SELECT chat_id FROM campaign_sends WHERE sent_at >= ?",
+            (cutoff_ts,),
+        ).fetchall()
+    return {row["chat_id"] for row in rows}
 
 
 def db_log_click(button_key: str, chat_id: int) -> None:

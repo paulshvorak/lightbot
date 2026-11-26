@@ -6,6 +6,25 @@ from .config import TZ
 
 # ================= FORMATTING =================
 
+_BASE36_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def encode_base36(n: int) -> str:
+    """Короткий непрозорий код замість голого chat_id у реферальних лінках."""
+    if n == 0:
+        return "0"
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    digits = []
+    while n:
+        n, r = divmod(n, 36)
+        digits.append(_BASE36_ALPHABET[r])
+    return sign + "".join(reversed(digits))
+
+
+def decode_base36(s: str) -> int:
+    return int(s, 36)
+
 
 def subscription_display_name(queue: int, subqueue: int, label: Optional[str]) -> str:
     """Повна назва з номером — для налаштувань (список черг, підтвердження перейменування)."""

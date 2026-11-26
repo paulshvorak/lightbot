@@ -24,6 +24,7 @@ from ..db import (
 from ..formatting import (
     _cooldown_left,
     day_str,
+    decode_base36,
     filter_past_intervals,
     format_outages_by_dayparts_today,
     intervals_to_text,
@@ -84,9 +85,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_new and context.args:
         arg = context.args[0]
-        if arg.startswith("ref_"):
+        if arg.startswith("r") and len(arg) > 1:
             try:
-                referrer_id = int(arg[len("ref_"):])
+                referrer_id = decode_base36(arg[1:])
                 if referrer_id != chat_id:
                     db_set_referral(chat_id, referrer_id)
             except ValueError:

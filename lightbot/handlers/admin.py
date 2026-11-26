@@ -13,7 +13,7 @@ from ..db import (
     db_delete_user,
     db_get_last_user,
     db_referral_top,
-    db_referral_total,
+    db_referral_totals,
     db_users_stats_by_day,
     touch_from_update,
 )
@@ -151,16 +151,16 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = BUTTON_LABELS.get(button_key, button_key)
             lines.append(f"{label}: сьогодні {today_cnt}, всього {total_cnt}")
 
-    referral_total = db_referral_total()
+    referral_total, referral_activated = db_referral_totals()
     top_referrers = db_referral_top(limit=5)
 
     lines.append("")
-    lines.append(f"📤 Прийшли через «Поділитись»: {referral_total}")
+    lines.append(f"📤 Прийшли через «Поділитись»: {referral_total} (обрали чергу: {referral_activated})")
     if top_referrers:
         lines.append("Топ рефералів:")
-        for chat_id, username, cnt in top_referrers:
+        for chat_id, username, total_cnt, activated_cnt in top_referrers:
             uname = f"@{username}" if username else str(chat_id)
-            lines.append(f"{uname}: {cnt}")
+            lines.append(f"{uname}: {total_cnt} (активних: {activated_cnt})")
 
     text = "\n".join(lines)
 
