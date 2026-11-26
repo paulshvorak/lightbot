@@ -147,8 +147,11 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not clicks:
         lines.append("— немає даних —")
     else:
-        for button_key, today_cnt, total_cnt in clicks:
-            label = BUTTON_LABELS.get(button_key, button_key)
+        known_clicks = [c for c in clicks if c[0] in BUTTON_LABELS]
+        if not known_clicks:
+            lines.append("— немає даних —")
+        for button_key, today_cnt, total_cnt in known_clicks:
+            label = BUTTON_LABELS[button_key]
             lines.append(f"{label}: сьогодні {today_cnt}, всього {total_cnt}")
 
     referral_total, referral_activated = db_referral_totals()
